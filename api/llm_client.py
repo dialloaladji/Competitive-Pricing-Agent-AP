@@ -21,12 +21,33 @@ MOCK_PRODUCT_UNDERSTANDING = {
     "target_audience": "consumers",
     "price_indicators": {"msrp": 100.00}
 }
-MOCK_QUERIES = {"queries": ["buy SoundPro headphones", "SoundPro wireless headphones price", "SoundPro vs competitors"]}
+MOCK_QUERIES = {
+    "queries": [
+        "wireless noise cancelling headphones",
+        "over ear bluetooth headphones ANC",
+        "premium wireless headphones 2025",
+        "SoundPro wireless headphones buy",
+        "SoundPro WH-1000 price",
+        "SoundPro vs Bose vs Sony"
+    ]
+}
 MOCK_CANDIDATES = [
     {"title": "SoundPro Wireless Headphones", "price": 69.99, "currency": "USD",
      "url": "https://example.com/1", "merchant": "Amazon", "source": "serpapi"},
     {"title": "SoundPro Bluetooth 5.3 Headset", "price": 74.99, "currency": "USD",
-     "url": "https://example.com/2", "merchant": "Walmart", "source": "tavily"},
+     "url": "https://example.com/2", "merchant": "Walmart", "source": "serpapi"},
+    {"title": "Bose QuietComfort 45 Wireless ANC Headphones", "price": 329.00, "currency": "USD",
+     "url": "https://example.com/3", "merchant": "Best Buy", "source": "serpapi"},
+    {"title": "Sony WH-1000XM5 Wireless Noise Cancelling", "price": 349.99, "currency": "USD",
+     "url": "https://example.com/4", "merchant": "Amazon", "source": "serpapi"},
+    {"title": "Sennheiser Momentum 4 Wireless ANC Headphones", "price": 349.95, "currency": "USD",
+     "url": "https://example.com/5", "merchant": "Amazon", "source": "tavily"},
+    {"title": "Audio-Technica ATH-M50xBT2 Wireless", "price": 199.00, "currency": "USD",
+     "url": "https://example.com/6", "merchant": "B&H", "source": "tavily"},
+    {"title": "Anker Soundcore Space Q45 ANC Headphones", "price": 149.99, "currency": "USD",
+     "url": "https://example.com/7", "merchant": "Amazon", "source": "serpapi"},
+    {"title": "Case for SoundPro Headphones - Hard Shell", "price": 24.99, "currency": "USD",
+     "url": "https://example.com/8", "merchant": "eBay", "source": "tavily"},
 ]
 MOCK_JUDGMENT = [
     {"candidate_index": 0, "classification": "same_product", "confidence": 0.92,
@@ -156,10 +177,12 @@ class MockClient:
 async def search_tavily(query: str, max_results: int = 3) -> list[dict]:
     if settings.mock_mode:
         return [
-            {"title": "SoundPro - Official Store", "url": "https://soundpro.com/product",
-             "content": "SoundPro Wireless Headphones $69.99", "price": 69.99, "merchant": "SoundPro"},
-            {"title": "Amazon - SoundPro Headphones", "url": "https://amazon.com/dp/123",
-             "content": "SoundPro Bluetooth Headphones $74.99", "price": 74.99, "merchant": "Amazon"},
+            {"title": "Bose QuietComfort 45 Review - Best ANC Headphones", "url": "https://techblog.com/bose-qc45",
+             "content": "Bose QC45 Wireless Headphones $329 with ANC", "price": 329.00, "merchant": "Best Buy"},
+            {"title": "Sony WH-1000XM5 vs Sennheiser Momentum 4 Comparison", "url": "https://audioblog.com/compare",
+             "content": "Sony WH-1000XM5 $349 vs Sennheiser Momentum 4 $349", "price": 349.00, "merchant": "Amazon"},
+            {"title": "Best Wireless ANC Headphones 2025 Roundup", "url": "https://reviewsite.com/best-anc",
+             "content": "Top picks: Sony, Bose, Sennheiser, Anker Soundcore from $149 to $399", "price": None, "merchant": None},
         ]
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -179,10 +202,16 @@ async def search_tavily(query: str, max_results: int = 3) -> list[dict]:
 async def search_serpapi(query: str, num: int = 5) -> list[dict]:
     if settings.mock_mode:
         return [
-            {"title": "SoundPro Wireless Bluetooth Headphones", "price": 69.99, "currency": "USD",
+            {"title": "Sony WH-1000XM5 Wireless Noise Cancelling Headphones", "price": 349.99, "currency": "USD",
              "url": "https://serpapi.com/show?item=1", "merchant": "Amazon", "source": "google_shopping"},
-            {"title": "SoundPro Noise Cancelling Headphones", "price": 79.99, "currency": "USD",
+            {"title": "Bose QuietComfort 45 ANC Headphones Black", "price": 329.00, "currency": "USD",
              "url": "https://serpapi.com/show?item=2", "merchant": "Best Buy", "source": "google_shopping"},
+            {"title": "Sennheiser Momentum 4 Wireless ANC", "price": 349.95, "currency": "USD",
+             "url": "https://serpapi.com/show?item=3", "merchant": "Amazon", "source": "google_shopping"},
+            {"title": "SoundPro Wireless Headphones WH-1000", "price": 69.99, "currency": "USD",
+             "url": "https://serpapi.com/show?item=4", "merchant": "Walmart", "source": "google_shopping"},
+            {"title": "Anker Soundcore Space Q45 Adaptive ANC", "price": 149.99, "currency": "USD",
+             "url": "https://serpapi.com/show?item=5", "merchant": "Amazon", "source": "google_shopping"},
         ]
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(

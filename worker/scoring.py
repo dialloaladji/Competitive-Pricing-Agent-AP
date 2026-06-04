@@ -119,7 +119,26 @@ def _price_coherence(price: float | None, target_price: float | None) -> float:
     return 0.0
 
 
-def deterministic_pre_score(product: Any, candidate: dict) -> dict:
+def _cross_brand_bonus(product_brand: str | None, title: str) -> float:
+    if not product_brand or not title:
+        return 0.0
+    brand_lower = product_brand.lower().strip()
+    title_lower = title.lower()
+    if brand_lower not in title_lower:
+        return 0.15
+    return 0.0
+
+
+def _same_brand_merchant_count(product_brand: str | None, title: str, all_scores: list | None) -> bool:
+    if not product_brand or not title:
+        return False
+    brand_lower = product_brand.lower().strip()
+    title_lower = title.lower()
+    return brand_lower in title_lower
+
+
+def deterministic_pre_score(product: Any, candidate: dict,
+                            all_scores: list[dict] | None = None) -> dict:
     title = candidate.get("title") or ""
     description = candidate.get("content") or candidate.get("description") or ""
     raw_price = candidate.get("price")
@@ -132,10 +151,12 @@ def deterministic_pre_score(product: Any, candidate: dict) -> dict:
     kw_score = _keyword_overlap(product.name, product.description, candidate)
     price_score = _price_coherence(price, product.target_price)
     accessory_penalty = -0.5 if _is_accessory(title, description) else 0.0
+    cross_brand = _cross_brand_bonus(product.brand, title)
 
-    total = max(0.0, min(1.0, cat_score + kw_score + price_score + accessory_penalty))
+    total = max(0.0, min(1.0, cat_score + kw_score + price_score + accessory_penalty + cross_brand))
 
     is_acc = accessory_penalty < -0.1
+    is_same_brand = _same_brand_merchant_count(product.brand, title, all_scores)
 
     if total >= 0.45:
         hint = "direct_competitor"
@@ -151,5 +172,6 @@ def deterministic_pre_score(product: Any, candidate: dict) -> dict:
     return {
         "deterministic_score": round(total, 3),
         "is_accessory": is_acc,
+        "is_same_brand": is_same_brand,
         "classification_hint": hint,
     }

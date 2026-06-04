@@ -348,7 +348,27 @@ async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depend
                         f"accessory={det.get('is_accessory',False)}"
                     )
 
-            if valid_count > 0:
+            if valid_count >= 3:
+                logger.info(f"Got {valid_count} matches — enough to stop")
+                break
+
+            if iteration >= max_iterations:
+                if valid_count > 0:
+                    logger.info(f"Max iterations reached with {valid_count} matches — accepting")
+                else:
+                    logger.info(f"Max iterations reached with 0 matches")
+                break
+
+            logger.info(f"Only {valid_count} matches, trying reformulation (iteration {iteration}/{max_iterations})")
+            a8 = await agent_reflection(llm, product, len(normalized), valid_count, scored,
+                                         product.target_price, run_id, iteration)
+            if a8["needs_reformulation"]:
+                a9 = await agent_query_reformulator(llm, product, queries, a8["issues"], attributes, run_id, iteration)
+                queries = a9["queries"]
+                iteration += 1
+                continue
+            else:
+                logger.info(f"Reflection says no reformulation needed — keeping {valid_count} matches")
                 break
 
             a8 = await agent_reflection(llm, product, len(normalized), valid_count, scored,
