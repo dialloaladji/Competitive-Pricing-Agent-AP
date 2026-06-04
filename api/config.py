@@ -13,9 +13,9 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://localhost:6379/2"
 
     llm_provider: str = "llamacpp"
-    llamacpp_base_url: str = "https://api.groq.com/openai/v1"
-    llamacpp_model: str = "llama-3.1-8b-instant"
-    llamacpp_api_key: str = ""
+    llama_cpp_base_url: str = "https://api.groq.com/openai/v1"
+    llama_cpp_model: str = "llama-3.1-8b-instant"
+    llama_cpp_api_key: str = ""
     llm_max_tokens: int = 512
 
     tavily_api_key: str = ""
@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 settings = Settings()

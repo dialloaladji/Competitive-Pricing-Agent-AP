@@ -4,7 +4,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
-import redis.asynced as aioredis
+import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -204,7 +204,7 @@ async def analyze_product(product_id: str, db: AsyncSession = Depends(get_db)):
     product = await db.get(Product, product_id)
     if not product:
         raise HTTPException(404, "Product not found")
-    run = AnalysisRun(product_id=product_id, status=AnalysisStatus.pending, metadata={"trigger": "api"})
+    run = AnalysisRun(product_id=product_id, status=AnalysisStatus.pending, run_metadata={"trigger": "api"})
     db.add(run)
     await db.commit()
     await db.refresh(run)

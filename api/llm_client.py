@@ -53,9 +53,9 @@ def estimate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
 
 class GroqClient:
     def __init__(self):
-        self.base_url = settings.llamacpp_base_url
-        self.model = settings.llamacpp_model
-        self.api_key = settings.llamacpp_api_key
+        self.base_url = settings.llama_cpp_base_url
+        self.model = settings.llama_cpp_model
+        self.api_key = settings.llama_cpp_api_key
         self.client = httpx.AsyncClient(timeout=60)
 
     @retry(

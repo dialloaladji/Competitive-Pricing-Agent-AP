@@ -75,7 +75,7 @@ async def agent_product_understanding(llm: Any, product: Product, run_id: str, i
         "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
         "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
-        "metadata": {"parsed_output": parsed} if parse_ok else {"raw": result["content"]},
+        "log_metadata": {"parsed_output": parsed} if parse_ok else {"raw": result["content"]},
     }
 
     async with async_session_factory() as db:
@@ -123,7 +123,7 @@ async def agent_query_generator(llm: Any, product: Product, attributes: list, ru
         "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
         "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
-        "metadata": {"queries": queries},
+        "log_metadata": {"queries": queries},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -148,7 +148,7 @@ async def agent_serpapi_search(queries: list[str], run_id: str, iteration: int) 
         "iteration_number": iteration, "latency_ms": latency,
         "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0,
         "model_name": "serpapi", "prompt_version": "1.0", "json_parse_success": True,
-        "metadata": {"query_count": len(queries), "result_count": len(all_results)},
+        "log_metadata": {"query_count": len(queries), "result_count": len(all_results)},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -173,7 +173,7 @@ async def agent_tavily_search(queries: list[str], run_id: str, iteration: int) -
         "iteration_number": iteration, "latency_ms": latency,
         "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0,
         "model_name": "tavily", "prompt_version": "1.0", "json_parse_success": True,
-        "metadata": {"query_count": len(queries), "result_count": len(all_results)},
+        "log_metadata": {"query_count": len(queries), "result_count": len(all_results)},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -220,7 +220,7 @@ async def agent_candidate_normalizer(llm: Any, product: Product, raw_candidates:
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
         "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
         "candidate_count": len(normalized),
-        "metadata": {"raw_count": len(raw_candidates), "normalized_count": len(normalized)},
+        "log_metadata": {"raw_count": len(raw_candidates), "normalized_count": len(normalized)},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -271,7 +271,7 @@ async def agent_llm_judge(llm: Any, product: Product, normalized: list[dict], at
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
         "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
         "valid_match_count": sum(1 for j in judgments if j.get("is_match")),
-        "metadata": {"judgments": judgments},
+        "log_metadata": {"judgments": judgments},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -359,7 +359,7 @@ async def agent_reflection(llm: Any, product: Product, candidate_count: int, val
         "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
         "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
-        "metadata": {"quality_score": parsed.get("quality_score"), "needs_reformulation": needs_reform, "issues": parsed.get("issues")},
+        "log_metadata": {"quality_score": parsed.get("quality_score"), "needs_reformulation": needs_reform, "issues": parsed.get("issues")},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -407,7 +407,7 @@ async def agent_query_reformulator(llm: Any, product: Product, previous_queries:
         "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
         "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
-        "metadata": {"new_queries": new_queries, "strategy": parsed.get("strategy") if parsed else ""},
+        "log_metadata": {"new_queries": new_queries, "strategy": parsed.get("strategy") if parsed else ""},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -456,7 +456,7 @@ async def agent_market_analyst(llm: Any, product: Product, scored: list[dict], v
         "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
         "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
-        "metadata": {"analysis_summary": {k: v for k, v in parsed.items() if k != "competitor_table"}},
+        "log_metadata": {"analysis_summary": {k: v for k, v in parsed.items() if k != "competitor_table"}},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -583,7 +583,7 @@ async def _run_analysis(product_id: str, run_id: str):
             best_match_score=best["score"] if best else None,
             price_confidence=a10.get("analysis", {}).get("confidence"),
             final_decision=a10.get("analysis"),
-            metadata={"iterations": iteration, "total_queries": queries},
+            run_metadata={"iterations": iteration, "total_queries": queries},
         )
 
         # Save valid offers
@@ -627,7 +627,7 @@ async def _track_all_prices():
             run_id = str(uuid.uuid4())
             async with async_session_factory() as db:
                 run = AnalysisRun(product_id=str(product.id), status=AnalysisStatus.pending,
-                                  metadata={"trigger": "scheduler"})
+                                  run_metadata={"trigger": "scheduler"})
                 db.add(run)
                 await db.commit()
                 await db.refresh(run)

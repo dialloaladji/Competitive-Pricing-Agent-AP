@@ -86,7 +86,7 @@ class AnalysisRun(Base):
     price_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     final_decision: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    run_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     product = relationship("Product", back_populates="analysis_runs")
@@ -109,7 +109,7 @@ class AgentLog(Base):
     prompt_version: Mapped[str | None] = mapped_column(String(50), nullable=True)
     json_parse_success: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
-    metadata: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    log_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     analysis_run = relationship("AnalysisRun", back_populates="agent_logs")
