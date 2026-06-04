@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     mock_mode: bool = False
     debug: bool = True
 
-    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/pricing_agent"
+    database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/postgres"
     redis_url: str = "redis://localhost:6379/0"
 
     celery_broker_url: str = "redis://localhost:6379/1"

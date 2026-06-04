@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -27,7 +28,7 @@ class ProductUpdate(BaseModel):
 
 
 class ProductOut(BaseModel):
-    id: str
+    id: uuid.UUID
     name: str
     description: str
     category: str | None
@@ -45,8 +46,8 @@ class ProductOut(BaseModel):
 
 
 class OfferOut(BaseModel):
-    id: str
-    product_id: str
+    id: uuid.UUID
+    product_id: uuid.UUID
     source: str
     competitor_name: str
     title: str
@@ -63,8 +64,8 @@ class OfferOut(BaseModel):
 
 
 class AnalysisRunOut(BaseModel):
-    id: str
-    product_id: str
+    id: uuid.UUID
+    product_id: uuid.UUID
     status: str
     started_at: datetime | None
     completed_at: datetime | None
@@ -83,8 +84,8 @@ class AnalysisRunOut(BaseModel):
 
 
 class PriceSnapshotOut(BaseModel):
-    id: str
-    product_id: str
+    id: uuid.UUID
+    product_id: uuid.UUID
     price: float
     currency: str
     snapshot_date: datetime
