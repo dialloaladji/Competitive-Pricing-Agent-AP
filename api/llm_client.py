@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from typing import Any
@@ -14,9 +15,11 @@ GROQ_PRICES = {
 }
 
 MOCK_PRODUCT_UNDERSTANDING = {
-    "name": "Wireless Bluetooth Headphones", "category": "Electronics",
-    "brand": "SoundPro", "attributes": ["wireless", "bluetooth 5.3", "noise cancelling"],
-    "target_audience": "consumers", "price_indicators": {"msrp": 79.99}
+    "name": "Generic Target Product", "category": "General",
+    "brand": "Generic Brand",
+    "attributes": ["standard", "general purpose"],
+    "target_audience": "consumers",
+    "price_indicators": {"msrp": 100.00}
 }
 MOCK_QUERIES = {"queries": ["buy SoundPro headphones", "SoundPro wireless headphones price", "SoundPro vs competitors"]}
 MOCK_CANDIDATES = [
@@ -25,8 +28,18 @@ MOCK_CANDIDATES = [
     {"title": "SoundPro Bluetooth 5.3 Headset", "price": 74.99, "currency": "USD",
      "url": "https://example.com/2", "merchant": "Walmart", "source": "tavily"},
 ]
-MOCK_JUDGMENT = [{"candidate_index": 0, "is_match": True, "confidence": 0.92, "reason": "Exact product match"},
-                 {"candidate_index": 1, "is_match": True, "confidence": 0.85, "reason": "Same brand, comparable specs"}]
+MOCK_JUDGMENT = [
+    {"candidate_index": 0, "classification": "same_product", "confidence": 0.92,
+     "reason": "Exact product match"},
+    {"candidate_index": 1, "classification": "direct_competitor", "confidence": 0.85,
+     "reason": "Same brand, comparable specs"},
+    {"candidate_index": 2, "classification": "functional_equivalent", "confidence": 0.72,
+     "reason": "Different brand but same category and features"},
+    {"candidate_index": 3, "classification": "cheaper_alternative", "confidence": 0.65,
+     "reason": "Lower price, same functional category"},
+    {"candidate_index": 4, "classification": "accessory_or_part", "confidence": 0.90,
+     "reason": "This is a case/cover for the product, not a competitor"},
+]
 MOCK_REFLECTION = {"quality_score": 0.8, "needs_reformulation": False, "issues": [], "confidence": 0.85}
 MOCK_QUERIES_REFORMULATED = {"previous_issues": ["queries too narrow"], "new_queries": ["wireless headphones deals", "noise cancelling headphones price comparison"], "strategy": "broaden search"}
 MOCK_MARKET_ANALYSIS = {
@@ -39,9 +52,11 @@ MOCK_MARKET_ANALYSIS = {
 
 
 def get_llm_client():
+    if settings.mock_mode:
+        return MockClient()
     if settings.llm_provider == "llamacpp":
         return GroqClient()
-    elif settings.llm_provider == "mock" or settings.mock_mode:
+    if settings.llm_provider == "mock":
         return MockClient()
     return GroqClient()
 
@@ -59,8 +74,8 @@ class GroqClient:
         self.client = httpx.AsyncClient(timeout=60)
 
     @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=1, max=10),
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
         retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
     )
     async def chat(self, system: str, user: str, max_tokens: int | None = None) -> dict[str, Any]:
@@ -79,6 +94,9 @@ class GroqClient:
                 "response_format": {"type": "json_object"},
             },
         )
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 10))
+            await asyncio.sleep(retry_after)
         response.raise_for_status()
         data = response.json()
         latency = (time.time() - start) * 1000
@@ -119,10 +137,10 @@ class MockClient:
             return MOCK_QUERIES
         if "normalize" in system.lower():
             return MOCK_CANDIDATES
-        if "product matching" in system.lower() or "valid match" in system.lower():
-            return MOCK_JUDGMENT
         if "quality assurance" in system.lower() or "evaluate the quality" in system.lower():
             return MOCK_REFLECTION
+        if "product matching" in system.lower() or "valid match" in system.lower():
+            return MOCK_JUDGMENT
         if "query reformul" in system.lower() or "improved queries" in system.lower():
             return MOCK_QUERIES_REFORMULATED
         if "market intelligence" in system.lower() or "competitive market analysis" in system.lower():

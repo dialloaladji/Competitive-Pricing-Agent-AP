@@ -13,6 +13,3 @@ CMD celery -A worker.celery_app worker --loglevel=info --concurrency=4
 
 FROM base AS scheduler
 CMD celery -A worker.celery_app beat --loglevel=info
-
-FROM base AS frontend
-CMD streamlit run frontend/app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true

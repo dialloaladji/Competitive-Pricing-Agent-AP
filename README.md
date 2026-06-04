@@ -5,22 +5,28 @@ Real-time competitive pricing analysis powered by LLM agents (Groq/Llama), web s
 ## Architecture
 
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│  Streamlit  │────▶│   FastAPI    │────▶│   Celery     │
-│  Frontend   │     │   Backend    │     │   Worker     │
-└─────────────┘     └──────┬───────┘     └──────┬───────┘
-                           │                     │
-                           ▼                     ▼
-                     ┌──────────┐          ┌──────────┐
-                     │PostgreSQL│          │  Redis   │
-                     └──────────┘          └──────────┘
+┌────────────────────────────────────────┐
+│            FastAPI Backend             │
+│  POST /api/v1/products/analyze-equiv  │
+│  (synchronous — 10 AI agents in-line) │
+└──────┬───────────────────────────┬─────┘
+       │                           │
+       ▼                           ▼
+ ┌──────────┐               ┌──────────┐
+ │PostgreSQL│               │  Redis   │
+ └──────────┘               └──────────┘
+       ▲                           ▲
+       │                           │
+ ┌─────┴─────────────┐   ┌────────┴────────┐
+ │  Celery Worker    │   │  Celery Beat    │
+ │  (async analysis) │   │  (scheduler)    │
+ └───────────────────┘   └─────────────────┘
 ```
 
 ### Services (Railway)
 | Service | Tech | Port |
 |---|---|---|
 | `api` | FastAPI + Uvicorn | 8000 |
-| `frontend` | Streamlit | 8501 |
 | `worker` | Celery | — |
 | `scheduler` | Celery Beat | — |
 | `postgres` | PostgreSQL 16 | 5432 |
@@ -72,11 +78,9 @@ celery -A worker.celery_app worker --loglevel=info
 # Terminal 3 — Scheduler
 celery -A worker.celery_app beat --loglevel=info
 
-# Terminal 4 — Frontend
-streamlit run frontend/app.py --server.port 8501
 ```
 
-Open **http://localhost:8501** for the dashboard.
+> **Note:** The default port 8000 is often occupied by Docker Desktop. Use `--port 8001` if needed.
 
 ### Or run everything with Docker Compose
 ```bash
@@ -94,7 +98,8 @@ docker compose up --build
 | `GET` | `/api/v1/products/{id}` | Get product |
 | `PUT` | `/api/v1/products/{id}` | Update product |
 | `DELETE` | `/api/v1/products/{id}` | Delete product |
-| `POST` | `/api/v1/products/{id}/analyze` | Trigger AI analysis |
+| `POST` | `/api/v1/products/analyze-equivalents` | Synchronous AI analysis (creates product + runs 10 agents) |
+| `POST` | `/api/v1/products/{id}/analyze` | Trigger Celery async analysis |
 | `GET` | `/api/v1/products/{id}/analysis` | Analysis history |
 | `GET` | `/api/v1/products/{id}/analysis/latest` | Latest analysis |
 | `GET` | `/api/v1/products/{id}/offers` | Competitor offers |
@@ -123,9 +128,8 @@ railway env set LANGFUSE_SECRET_KEY=sk-lf-your-key
 ```
 
 ### 4. Create services
-In Railway dashboard, create 4 services all pointing to the same repo:
+In Railway dashboard, create 3 services all pointing to the same repo:
 - **api** — `railway run` with target `api`
-- **frontend** — `railway run` with target `frontend`
 - **worker** — `railway run` with target `worker`
 - **scheduler** — `railway run` with target `scheduler`
 
@@ -147,7 +151,8 @@ railway run alembic upgrade head
 | `SERPAPI_API_KEY` | ✅ | — | SerpApi Google Shopping |
 | `LANGFUSE_PUBLIC_KEY` | — | — | Langfuse observability |
 | `LANGFUSE_SECRET_KEY` | — | — | Langfuse observability |
-| `MOCK_MODE` | — | `false` | Run without API keys |
+| `MOCK_MODE` | — | `false` | Run without API keys (overrides `LLM_PROVIDER`) |
+| `LLM_PROVIDER` | — | `groq` | LLM backend (`groq`, `llamacpp`, `mock`) |
 | `LLM_MAX_TOKENS` | — | `512` | Max LLM response tokens |
 
 ## Observability (Langfuse)
@@ -161,4 +166,21 @@ Each product analysis creates a Langfuse trace with spans for all 10 agents. Met
 
 ## Mock Mode
 
-Set `MOCK_MODE=true` to run the full stack without any API keys. All LLM calls and external APIs return realistic mock data.
+Set `MOCK_MODE=true` to run the full stack without any API keys. All LLM calls and external APIs return realistic mock data. Mock mode is checked **before** `LLM_PROVIDER`, so setting `MOCK_MODE=true` always uses mock clients regardless of the provider setting.
+
+## Testing with Swagger UI
+
+Start the API and open **http://localhost:8001/docs** (or your configured port) for interactive Swagger UI documentation. The synchronous endpoint `POST /api/v1/products/analyze-equivalents` is the primary testing entrypoint:
+
+```json
+{
+  "name": "Sony WH-1000XM5",
+  "description": "Wireless noise-cancelling headphones",
+  "category": "electronics",
+  "brand": "Sony",
+  "target_price": 349.99,
+  "currency": "USD"
+}
+```
+
+> **Note:** Mock mode returns results instantly (~2s). Real mode requires valid API keys and may take 30–60s depending on rate limits.

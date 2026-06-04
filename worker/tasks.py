@@ -194,11 +194,12 @@ async def agent_candidate_normalizer(llm: Any, product: Product, raw_candidates:
         "prices, URLs, or merchant names. Deduplicate by URL (same URL = same offer). "
         "Standardize currency to ISO 4217. Output JSON array of normalized offers."
     )
+    candidates_for_llm = raw_candidates[:30]
     user = (
-        f"Target Product: {product.name} ({product.brand or 'N/A'})\n\nRaw candidates:\n"
+        f"Target Product: {product.name} ({product.brand or 'N/A'})\n\nRaw candidates ({len(raw_candidates)} total, showing first {len(candidates_for_llm)}):\n"
         + "\n".join(f"[{i+1}] Title: {c.get('title','')} | Price: {c.get('price','')} | "
                     f"URL: {c.get('url','')} | Merchant: {c.get('merchant','N/A')}"
-                    for i, c in enumerate(raw_candidates))
+                    for i, c in enumerate(candidates_for_llm))
         + "\n\nNormalize each candidate. Deduplicate by URL. Standardize currency. "
         "Remove entries with missing price or URL. Output a JSON array of normalized_candidates."
     )
@@ -219,8 +220,7 @@ async def agent_candidate_normalizer(llm: Any, product: Product, raw_candidates:
         "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
         "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
-        "candidate_count": len(normalized),
-        "log_metadata": {"raw_count": len(raw_candidates), "normalized_count": len(normalized)},
+        "log_metadata": {"raw_count": len(raw_candidates), "normalized_count": len(normalized), "candidate_count": len(normalized)},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -236,13 +236,27 @@ async def agent_candidate_normalizer(llm: Any, product: Product, raw_candidates:
 async def agent_llm_judge(llm: Any, product: Product, normalized: list[dict], attributes: list, run_id: str, iteration: int) -> dict:
     start = time.time()
     system = (
-        "You are a strict product matching validator. Determine if a competitor offer is a valid match "
-        "for the target product. CRITICAL RULES: A match requires at least 2 of: same brand, same model number, "
-        "near-identical title. Confidence must be < 0.6 if any information is uncertain. "
-        "Set is_match=false if you are unsure. Do not assume generics match branded products. "
-        "A 'compatible with' or 'for' product is NOT a match. All prices must be taken literally "
-        "from the candidate data. Output MUST be valid JSON array: "
-        "[{ 'candidate_index': int, 'is_match': bool, 'confidence': float, 'reason': '...' }]"
+        "You are a competitive market analyst. Identify credible competitive alternatives, "
+        "substitutes, or functional equivalents to the target product.\n\n"
+        "You are NOT looking only for exact product duplicates.\n\n"
+        "Evaluate each candidate by asking:\n"
+        "- Does it belong to the same functional category?\n"
+        "- Does it solve the same user need or business use case?\n"
+        "- Are its main features comparable?\n"
+        "- Is its price in a coherent range?\n\n"
+        "CLASSIFY each candidate into one of:\n"
+        "- same_product: exact or near-exact match\n"
+        "- direct_competitor: very comparable product from another brand\n"
+        "- functional_equivalent: same function, different features\n"
+        "- cheaper_alternative: relevant but cheaper\n"
+        "- premium_alternative: relevant but more premium\n"
+        "- previous_generation: older version of same product line\n"
+        "- newer_generation: newer version of same product line\n"
+        "- accessory_or_part: accessory, spare part, consumable, complementary (REJECT)\n"
+        "- irrelevant: not related (REJECT)\n\n"
+        "Return strictly valid JSON array:\n"
+        '[{"candidate_index": 0, "classification": "direct_competitor", '
+        '"confidence": 0.78, "reason": "..."}]'
     )
     user = (
         f"TARGET PRODUCT: {product.name} | Brand: {product.brand} | "
@@ -251,7 +265,7 @@ async def agent_llm_judge(llm: Any, product: Product, normalized: list[dict], at
         + "\n".join(f"[{i}] Title: '{c.get('title','')}' | Price: {c.get('price','')} | "
                     f"Merchant: {c.get('merchant','')} | URL: {c.get('url','')}"
                     for i, c in enumerate(normalized))
-        + "\n\nFor each candidate, judge if valid match."
+        + "\n\nFor each candidate, classify as competitive equivalent, functional equivalent, or reject."
     )
     result = await llm.chat(system, user)
     latency = (time.time() - start) * 1000
@@ -260,18 +274,23 @@ async def agent_llm_judge(llm: Any, product: Product, normalized: list[dict], at
     judgments = []
     try:
         parsed = json.loads(result["content"])
-        judgments = parsed if isinstance(parsed, list) else parsed.get("judgments", [])
+        raw = parsed if isinstance(parsed, list) else parsed.get("judgments", [])
+        judgments = [j for j in raw if isinstance(j, dict)]
         parse_ok = True
     except json.JSONDecodeError:
         judgments = []
+
+    VALID = {"same_product", "direct_competitor", "functional_equivalent",
+             "cheaper_alternative", "premium_alternative",
+             "previous_generation", "newer_generation"}
+    valid_count = sum(1 for j in judgments if j.get("classification") in VALID)
 
     log_data = {
         "iteration_number": iteration, "latency_ms": latency,
         "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
         "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
-        "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
-        "valid_match_count": sum(1 for j in judgments if j.get("is_match")),
-        "log_metadata": {"judgments": judgments},
+        "model_name": result.get("model"), "prompt_version": "2.0", "json_parse_success": parse_ok,
+        "log_metadata": {"judgments": judgments, "valid_match_count": valid_count},
     }
     async with async_session_factory() as db:
         trace_id = str(uuid.uuid4())
@@ -284,12 +303,58 @@ async def agent_llm_judge(llm: Any, product: Product, normalized: list[dict], at
 
 # ───────────────────────────── Agent 7: scoring_engine (deterministic) ─────────────────────────────
 
-def agent_scoring_engine(product: Product, normalized: list[dict], judgments: list[dict]) -> list[dict]:
+VALID_CLASSIFICATIONS = frozenset({
+    "same_product", "direct_competitor", "functional_equivalent",
+    "cheaper_alternative", "premium_alternative",
+    "previous_generation", "newer_generation",
+})
+
+CLASSIFICATION_CONFIDENCE_THRESHOLDS = {
+    "same_product": 0.45,
+    "direct_competitor": 0.40,
+    "functional_equivalent": 0.35,
+    "cheaper_alternative": 0.35,
+    "premium_alternative": 0.35,
+    "previous_generation": 0.35,
+    "newer_generation": 0.35,
+}
+
+
+def agent_scoring_engine(product: Product, normalized: list[dict], judgments: list[dict],
+                         deterministic_scores: list[dict] | None = None) -> list[dict]:
     scored = []
     for i, candidate in enumerate(normalized):
         judgment = next((j for j in judgments if j.get("candidate_index") == i), None)
-        if not judgment or not judgment.get("is_match"):
-            continue
+        pre = deterministic_scores[i] if deterministic_scores and i < len(deterministic_scores) else {}
+
+        classification = "irrelevant"
+        confidence = 0.0
+        reason = ""
+
+        if judgment:
+            raw_classification = judgment.get("classification", "irrelevant")
+            confidence = float(judgment.get("confidence", 0))
+            reason = str(judgment.get("reason", ""))
+
+            if raw_classification in ("accessory_or_part", "irrelevant"):
+                continue
+
+            if raw_classification in CLASSIFICATION_CONFIDENCE_THRESHOLDS:
+                min_conf = CLASSIFICATION_CONFIDENCE_THRESHOLDS[raw_classification]
+                if confidence >= min_conf:
+                    classification = raw_classification
+                else:
+                    classification = "irrelevant"
+            else:
+                classification = "irrelevant"
+        else:
+            det_score = pre.get("deterministic_score", 0)
+            if det_score >= 0.35 and not pre.get("is_accessory", False):
+                classification = pre.get("classification_hint", "functional_equivalent")
+                confidence = det_score
+            else:
+                continue
+
         raw_price = candidate.get("price", 0)
         try:
             price = float(raw_price) if raw_price else 0
@@ -303,8 +368,9 @@ def agent_scoring_engine(product: Product, normalized: list[dict], judgments: li
         trust_scores = {"amazon": 0.9, "walmart": 0.85, "bestbuy": 0.9,
                         "target": 0.85, "newegg": 0.8, "ebay": 0.6}
         trust_score = trust_scores.get(str(candidate.get("merchant", "")).lower(), 0.5)
-        relevance_score = judgment.get("confidence", 0.5)
-        score = 0.4 * price_score + 0.3 * relevance_score + 0.3 * trust_score
+
+        det_score = pre.get("deterministic_score", 0)
+        score = 0.25 * det_score + 0.35 * confidence + 0.25 * price_score + 0.15 * trust_score
 
         scored.append({
             "candidate_index": i,
@@ -314,11 +380,16 @@ def agent_scoring_engine(product: Product, normalized: list[dict], judgments: li
             "merchant": candidate.get("merchant"),
             "url": candidate.get("url"),
             "price_score": round(price_score, 3),
-            "relevance_score": round(relevance_score, 3),
+            "relevance_score": round(confidence, 3),
             "trust_score": round(trust_score, 3),
             "score": round(score, 3),
+            "classification": classification,
+            "deterministic_score": det_score,
         })
-    return sorted(scored, key=lambda x: x["score"], reverse=True)
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    for i, s in enumerate(scored):
+        s["candidate_index"] = i
+    return scored
 
 
 # ───────────────────────────── Agent 8: reflection_agent ─────────────────────────────
@@ -331,8 +402,8 @@ async def agent_reflection(llm: Any, product: Product, candidate_count: int, val
         "for quality and completeness. Check for: Price outliers (any price > 5x or < 0.2x target price "
         "→ flag), Semantic relevance (are matched products actually comparable?), Coverage (enough matches "
         "for market analysis?). Output JSON: { 'quality_score': 0.0-1.0, 'needs_reformulation': bool, "
-        "'issues': [...], 'confidence': 0.0-1.0 }. Only set needs_reformulation=true if quality_score < 0.5 "
-        "and fewer than 2 valid matches."
+        "'issues': [...], 'confidence': 0.0-1.0 }. Only set needs_reformulation=true if quality_score < 0.3 "
+        "and zero valid matches."
     )
     user = (
         f"Product: {product.name} ({product.brand or 'N/A'})\n"
@@ -348,8 +419,9 @@ async def agent_reflection(llm: Any, product: Product, candidate_count: int, val
     parsed = None
     parse_ok = False
     try:
-        parsed = json.loads(result["content"])
-        parse_ok = True
+        parsed_raw = json.loads(result["content"])
+        parsed = parsed_raw if isinstance(parsed_raw, dict) else {}
+        parse_ok = isinstance(parsed_raw, dict)
     except json.JSONDecodeError:
         parsed = {"quality_score": 0.3, "needs_reformulation": True, "issues": ["parse error"], "confidence": 0.3}
 

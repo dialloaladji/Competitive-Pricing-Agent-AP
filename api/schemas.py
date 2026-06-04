@@ -122,3 +122,49 @@ class DashboardSummary(BaseModel):
     avg_confidence: float | None
     best_price_drops: list[dict]
     recent_analyses: list[dict]
+
+
+class EquivalentRequest(BaseModel):
+    name: str
+    description: str = ""
+    category: str | None = None
+    brand: str | None = None
+    sku: str | None = None
+    target_price: float | None = None
+    currency: str = "USD"
+    max_iterations: int = 1
+
+
+VALID_CLASSIFICATIONS = frozenset({
+    "same_product", "direct_competitor", "functional_equivalent",
+    "cheaper_alternative", "premium_alternative",
+    "previous_generation", "newer_generation",
+})
+
+
+class EquivalentOut(BaseModel):
+    title: str
+    price: float
+    currency: str
+    merchant: str | None = None
+    brand: str | None = None
+    url: str
+    score: float
+    price_score: float
+    relevance_score: float
+    trust_score: float
+    classification: str = "functional_equivalent"
+
+
+class AnalyzeEquivalentsResponse(BaseModel):
+    product_id: str
+    product_name: str
+    run_id: str
+    total_latency_ms: float
+    candidate_count: int
+    valid_match_count: int
+    best_match_price: float | None
+    best_match_score: float | None
+    price_confidence: float | None
+    recommendation: str | None
+    equivalents: list[EquivalentOut]

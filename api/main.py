@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -18,6 +19,7 @@ from api.schemas import (
     ProductCreate, ProductUpdate, ProductOut, OfferOut,
     AnalysisRunOut, PriceSnapshotOut, MetricsSummary,
     AnalyzeResponse, DashboardSummary,
+    EquivalentRequest, EquivalentOut, AnalyzeEquivalentsResponse,
 )
 
 logging.basicConfig(level=logging.INFO, format='{"time":"%(asctime)s","level":"%(levelname)s","service":"api","message":"%(message)s"}')
@@ -213,6 +215,228 @@ async def analyze_product(product_id: str, db: AsyncSession = Depends(get_db)):
     celery_app.send_task("analyze_product", args=[str(product_id), str(run.id)])
     return AnalyzeResponse(run_id=str(run.id), product_id=product_id, status="pending",
                            message="Analysis started")
+
+
+@app.post("/api/v1/products/analyze-equivalents")
+async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depends(get_db)):
+    from worker.tasks import (
+        agent_product_understanding, agent_query_generator,
+        agent_serpapi_search, agent_tavily_search,
+        agent_candidate_normalizer, agent_llm_judge,
+        agent_scoring_engine, agent_reflection,
+        agent_query_reformulator, agent_market_analyst,
+        _create_agent_log, _update_analysis,
+    )
+    from api.llm_client import get_llm_client
+    from worker.scoring import deterministic_pre_score
+    from api.schemas import VALID_CLASSIFICATIONS
+
+    start_total = time.time()
+    product = Product(**data.model_dump(exclude={"max_iterations"}))
+    db.add(product)
+    await db.commit()
+    await db.refresh(product)
+
+    run = AnalysisRun(product_id=product.id, status=AnalysisStatus.running,
+                      started_at=datetime.utcnow(), run_metadata={"trigger": "api_sync"})
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+
+    run_id = str(run.id)
+    product_id = str(product.id)
+    llm = get_llm_client()
+    logger.info(f"LLM client: {type(llm).__name__}, mock_mode={settings.mock_mode}")
+
+    try:
+        a1 = await agent_product_understanding(llm, product, run_id, iteration=1)
+        attributes = a1.get("parsed", {}).get("attributes", [])
+
+        a2 = await agent_query_generator(llm, product, attributes, run_id, iteration=1)
+        queries = a2["queries"]
+
+        scored = []
+        raw_candidates = []
+        iteration = 1
+        max_iterations = data.max_iterations
+
+        while iteration <= max_iterations:
+            serpapi_results = []
+            tavily_results = []
+            try:
+                serpapi_results = await agent_serpapi_search(queries, run_id, iteration)
+            except Exception as e:
+                logger.warning(f"SerpApi search failed: {e}")
+            try:
+                tavily_results = await agent_tavily_search(queries, run_id, iteration)
+            except Exception as e:
+                logger.warning(f"Tavily search failed: {e}")
+            raw_candidates = (serpapi_results + tavily_results)[:60]
+
+            if not raw_candidates:
+                iteration += 1
+                if iteration > max_iterations:
+                    break
+                a9 = await agent_query_reformulator(llm, product, queries, ["no results"], attributes, run_id, iteration)
+                queries = a9["queries"]
+                continue
+
+            a5 = await agent_candidate_normalizer(llm, product, raw_candidates, run_id, iteration)
+            normalized = a5["normalized"]
+
+            if not normalized:
+                iteration += 1
+                if iteration > max_iterations:
+                    break
+                a9 = await agent_query_reformulator(llm, product, queries, ["no valid candidates"], attributes, run_id, iteration)
+                queries = a9["queries"]
+                continue
+
+            deterministic_scores = [deterministic_pre_score(product, c) for c in normalized]
+            scored_indices = [
+                i for i, s in enumerate(deterministic_scores)
+                if s["deterministic_score"] >= 0.15 and not s["is_accessory"]
+            ]
+            candidates_for_llm = [normalized[i] for i in scored_indices[:20]]
+            pre_scores_for_llm = [deterministic_scores[i] for i in scored_indices[:20]]
+            index_map = {new_idx: scored_indices[new_idx] for new_idx in range(len(candidates_for_llm))}
+
+            if not candidates_for_llm:
+                scored = []
+                iteration += 1
+                if iteration > max_iterations:
+                    break
+                continue
+
+            a6 = await agent_llm_judge(llm, product, candidates_for_llm, attributes, run_id, iteration)
+            judgments = a6["judgments"]
+            mapped_judgments = []
+            for j in judgments:
+                j_copy = dict(j)
+                orig_idx = j.get("candidate_index")
+                if orig_idx is not None and orig_idx in index_map:
+                    j_copy["candidate_index"] = index_map[orig_idx]
+                else:
+                    continue
+                mapped_judgments.append(j_copy)
+
+            all_det_scores = [deterministic_pre_score(product, c) for c in normalized]
+            scored = agent_scoring_engine(product, normalized, mapped_judgments, all_det_scores)
+            valid_count = len(scored)
+
+            for s_entry in scored:
+                s_entry["brand"] = None
+
+            logger.info(
+                f"Iteration {iteration}: {len(raw_candidates)} raw → {len(normalized)} normalized → "
+                f"{len(candidates_for_llm)} pre-scored → {len(mapped_judgments)} LLM judgments → {valid_count} valid"
+            )
+            for s_entry in scored:
+                logger.info(
+                    f"  ACCEPTED: [{s_entry.get('classification','?')}] "
+                    f"{s_entry.get('title','')[:50]} | "
+                    f"${s_entry.get('price',0)} | "
+                    f"deterministic={s_entry.get('deterministic_score',0):.2f} | "
+                    f"score={s_entry.get('score',0):.2f}"
+                )
+            for i, det in enumerate(deterministic_scores):
+                if i not in {s["candidate_index"] for s in scored}:
+                    logger.info(
+                        f"  REJECTED: [{det.get('classification_hint','?')}] "
+                        f"{normalized[i].get('title','')[:50]} | "
+                        f"det_score={det.get('deterministic_score',0):.2f} | "
+                        f"accessory={det.get('is_accessory',False)}"
+                    )
+
+            if valid_count > 0:
+                break
+
+            a8 = await agent_reflection(llm, product, len(normalized), valid_count, scored,
+                                         product.target_price, run_id, iteration)
+            if not a8["needs_reformulation"] or iteration >= max_iterations:
+                break
+
+            a9 = await agent_query_reformulator(llm, product, queries, a8["issues"], attributes, run_id, iteration)
+            queries = a9["queries"]
+            iteration += 1
+
+        a10 = await agent_market_analyst(llm, product, scored, len(scored), iteration, run_id, iteration=iteration)
+        analysis = a10.get("analysis", {})
+        total_latency = (time.time() - start_total) * 1000
+        best = scored[0] if scored else None
+
+        raw_rec = analysis.get("recommendation")
+        if isinstance(raw_rec, dict):
+            recommendation = raw_rec.get("message") or raw_rec.get("recommendation") or str(raw_rec)
+        else:
+            recommendation = raw_rec
+
+        run.status = AnalysisStatus.completed
+        run.completed_at = datetime.utcnow()
+        run.total_latency_ms = total_latency
+        run.candidate_count = len(raw_candidates)
+        run.valid_match_count = len(scored)
+        run.best_match_price = best["price"] if best else None
+        run.best_match_score = best["score"] if best else None
+        run.price_confidence = analysis.get("confidence")
+        run.final_decision = analysis
+        run.run_metadata = {"iterations": iteration}
+        await db.commit()
+
+        for s in scored:
+            offer = Offer(
+                product_id=product.id,
+                source="analysis",
+                competitor_name=s.get("title", "")[:255],
+                title=s.get("title", ""),
+                price=s.get("price", 0),
+                currency=s.get("currency", "USD"),
+                url=s.get("url", ""),
+                merchant=s.get("merchant"),
+            )
+            db.add(offer)
+        if best:
+            snap = PriceSnapshot(
+                product_id=product.id,
+                price=best["price"],
+                currency=best.get("currency", "USD"),
+            )
+            db.add(snap)
+        await db.commit()
+
+    except Exception as e:
+        run.status = AnalysisStatus.failed
+        run.error_message = str(e)
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+        import traceback
+        logger.error(f"Analysis failed: {e}\n{traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    finally:
+        await llm.close()
+
+    return AnalyzeEquivalentsResponse(
+        product_id=product_id,
+        product_name=product.name,
+        run_id=run_id,
+        total_latency_ms=total_latency,
+        candidate_count=run.candidate_count or 0,
+        valid_match_count=len(scored),
+        best_match_price=best["price"] if best else None,
+        best_match_score=best["score"] if best else None,
+        price_confidence=analysis.get("confidence"),
+        recommendation=recommendation,
+        equivalents=[
+            EquivalentOut(
+                title=s["title"], price=s["price"], currency=s.get("currency", "USD"),
+                merchant=s.get("merchant"), brand=s.get("brand"), url=s.get("url", ""),
+                score=s["score"], price_score=s["price_score"],
+                relevance_score=s["relevance_score"], trust_score=s["trust_score"],
+                classification=s.get("classification", "unknown"),
+            )
+            for s in scored
+        ],
+    )
 
 
 @app.get("/api/v1/products/{product_id}/analysis")
