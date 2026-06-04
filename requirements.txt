@@ -1,0 +1,17 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+sqlalchemy[asyncio]==2.0.35
+asyncpg==0.29.0
+alembic==1.13.2
+pydantic==2.9.2
+pydantic-settings==2.5.2
+redis==5.1.1
+celery==5.4.0
+openai==1.51.0
+httpx==0.27.2
+tenacity==9.0.0
+langfuse==2.55.0
+streamlit==1.39.0
+plotly==5.24.1
+pandas==2.2.2
+python-dotenv==1.0.1

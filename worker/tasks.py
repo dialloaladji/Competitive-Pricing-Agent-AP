@@ -1,0 +1,659 @@
+import json
+import logging
+import time
+import uuid
+from datetime import datetime
+from typing import Any
+
+from langfuse import Langfuse
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.config import settings
+from api.database import async_session_factory
+from api.models import Product, Offer, PriceSnapshot, AnalysisRun, AnalysisStatus, AgentLog
+from api.llm_client import get_llm_client, search_tavily, search_serpapi, estimate_cost
+from worker.celery_app import celery_app
+
+logger = logging.getLogger("worker")
+
+langfuse = None
+if settings.langfuse_public_key and settings.langfuse_secret_key:
+    langfuse = Langfuse(
+        public_key=settings.langfuse_public_key,
+        secret_key=settings.langfuse_secret_key,
+        host=settings.langfuse_base_url or "https://cloud.langfuse.com",
+    )
+
+
+async def _create_agent_log(db: AsyncSession, run_id: str, agent_name: str, data: dict):
+    log = AgentLog(run_id=run_id, agent_name=agent_name, **data)
+    db.add(log)
+    await db.commit()
+
+
+async def _update_analysis(db: AsyncSession, run_id: str, **kwargs):
+    run = await db.get(AnalysisRun, run_id)
+    if run:
+        for k, v in kwargs.items():
+            setattr(run, k, v)
+        await db.commit()
+
+
+# ───────────────────────────── Agent 1: product_understanding_agent ─────────────────────────────
+
+async def agent_product_understanding(llm: Any, product: Product, run_id: str, iteration: int) -> dict:
+    start = time.time()
+    system = (
+        "You are a product intelligence specialist. Your task is to analyze a product listing "
+        "and extract structured attributes. You must ONLY extract information explicitly present "
+        "in the product description. Do not infer, assume, or fabricate attributes. "
+        "If a field is not present in the description, set it to null. "
+        "Output must be valid JSON with keys: name, category, brand, attributes, target_audience, price_indicators."
+    )
+    user = (
+        f"Product Name: {product.name}\n"
+        f"Description: {product.description}\n"
+        f"Category: {product.category or 'Not specified'}\n"
+        f"Brand: {product.brand or 'Not specified'}\n"
+        f"SKU: {product.sku or 'Not specified'}\n"
+        f"Target Price: {product.target_price} {product.currency}\n\n"
+        "Extract: name, category, brand, key attributes, target audience, any price-related indicators."
+    )
+    result = await llm.chat(system, user)
+    latency = (time.time() - start) * 1000
+    parsed = None
+    parse_ok = False
+    try:
+        parsed = json.loads(result["content"])
+        parse_ok = True
+    except json.JSONDecodeError:
+        parsed = {"error": "failed to parse", "raw": result["content"]}
+
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
+        "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
+        "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
+        "metadata": {"parsed_output": parsed} if parse_ok else {"raw": result["content"]},
+    }
+
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="product_understanding_agent", metadata={"run_id": run_id, "product_id": str(product.id)})
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "product_understanding_agent", log_data)
+
+    return {"parsed": parsed, "latency_ms": latency, "parse_ok": parse_ok}
+
+
+# ───────────────────────────── Agent 2: query_generator_agent ─────────────────────────────
+
+async def agent_query_generator(llm: Any, product: Product, attributes: list, run_id: str, iteration: int) -> dict:
+    start = time.time()
+    system = (
+        "You are a competitive research query strategist. Generate search queries to find competing "
+        "products on Google Shopping and the web. Each query must be a real, specific search string "
+        "a human would type. Rules: Only generate queries based on the product name, brand, and category "
+        "provided. Do not invent competitor names. Include at least one query with 'buy', one with 'price', "
+        "one with 'vs'. Max 5 queries. Output JSON: { 'queries': ['...', '...'] }"
+    )
+    user = (
+        f"Product: {product.name}\nBrand: {product.brand or 'N/A'}\n"
+        f"Category: {product.category or 'N/A'}\n"
+        f"Key Attributes: {', '.join(attributes) if attributes else 'N/A'}\n"
+        f"Target Price: {product.target_price} {product.currency}\n\n"
+        "Generate up to 5 search queries."
+    )
+    result = await llm.chat(system, user)
+    latency = (time.time() - start) * 1000
+    parsed = None
+    parse_ok = False
+    queries = []
+    try:
+        parsed = json.loads(result["content"])
+        queries = parsed.get("queries", [])
+        parse_ok = True
+    except json.JSONDecodeError:
+        queries = [product.name]
+
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
+        "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
+        "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
+        "metadata": {"queries": queries},
+    }
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="query_generator_agent", metadata={"run_id": run_id, "product_id": str(product.id)})
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "query_generator_agent", log_data)
+    return {"queries": queries, "latency_ms": latency}
+
+
+# ───────────────────────────── Agent 3: serpapi_search ─────────────────────────────
+
+async def agent_serpapi_search(queries: list[str], run_id: str, iteration: int) -> list[dict]:
+    start = time.time()
+    all_results = []
+    for q in queries:
+        results = await search_serpapi(q, settings.web_search_max_results)
+        all_results.extend(results)
+
+    latency = (time.time() - start) * 1000
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0,
+        "model_name": "serpapi", "prompt_version": "1.0", "json_parse_success": True,
+        "metadata": {"query_count": len(queries), "result_count": len(all_results)},
+    }
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="serpapi_search", metadata={"run_id": run_id})
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "serpapi_search", log_data)
+    return all_results
+
+
+# ───────────────────────────── Agent 4: tavily_search ─────────────────────────────
+
+async def agent_tavily_search(queries: list[str], run_id: str, iteration: int) -> list[dict]:
+    start = time.time()
+    all_results = []
+    for q in queries:
+        results = await search_tavily(q, settings.web_search_max_results)
+        all_results.extend(results)
+
+    latency = (time.time() - start) * 1000
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": 0, "output_tokens": 0, "estimated_cost": 0,
+        "model_name": "tavily", "prompt_version": "1.0", "json_parse_success": True,
+        "metadata": {"query_count": len(queries), "result_count": len(all_results)},
+    }
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="tavily_search", metadata={"run_id": run_id})
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "tavily_search", log_data)
+    return all_results
+
+
+# ───────────────────────────── Agent 5: candidate_normalizer ─────────────────────────────
+
+async def agent_candidate_normalizer(llm: Any, product: Product, raw_candidates: list[dict], run_id: str, iteration: int) -> dict:
+    start = time.time()
+    system = (
+        "You are a data normalization expert. Normalize competitor offer data from various sources "
+        "into a unified schema. Rules: Only transform fields that exist in the input. Do not generate "
+        "prices, URLs, or merchant names. Deduplicate by URL (same URL = same offer). "
+        "Standardize currency to ISO 4217. Output JSON array of normalized offers."
+    )
+    user = (
+        f"Target Product: {product.name} ({product.brand or 'N/A'})\n\nRaw candidates:\n"
+        + "\n".join(f"[{i+1}] Title: {c.get('title','')} | Price: {c.get('price','')} | "
+                    f"URL: {c.get('url','')} | Merchant: {c.get('merchant','N/A')}"
+                    for i, c in enumerate(raw_candidates))
+        + "\n\nNormalize each candidate. Deduplicate by URL. Standardize currency. "
+        "Remove entries with missing price or URL. Output a JSON array of normalized_candidates."
+    )
+    result = await llm.chat(system, user)
+    latency = (time.time() - start) * 1000
+    parsed = None
+    parse_ok = False
+    normalized = []
+    try:
+        parsed = json.loads(result["content"])
+        normalized = parsed if isinstance(parsed, list) else parsed.get("normalized_candidates", [])
+        parse_ok = True
+    except json.JSONDecodeError:
+        normalized = []
+
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
+        "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
+        "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
+        "candidate_count": len(normalized),
+        "metadata": {"raw_count": len(raw_candidates), "normalized_count": len(normalized)},
+    }
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="candidate_normalizer", metadata={"run_id": run_id, "product_id": str(product.id)})
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "candidate_normalizer", log_data)
+    return {"normalized": normalized, "latency_ms": latency}
+
+
+# ───────────────────────────── Agent 6: llm_judge ─────────────────────────────
+
+async def agent_llm_judge(llm: Any, product: Product, normalized: list[dict], attributes: list, run_id: str, iteration: int) -> dict:
+    start = time.time()
+    system = (
+        "You are a strict product matching validator. Determine if a competitor offer is a valid match "
+        "for the target product. CRITICAL RULES: A match requires at least 2 of: same brand, same model number, "
+        "near-identical title. Confidence must be < 0.6 if any information is uncertain. "
+        "Set is_match=false if you are unsure. Do not assume generics match branded products. "
+        "A 'compatible with' or 'for' product is NOT a match. All prices must be taken literally "
+        "from the candidate data. Output MUST be valid JSON array: "
+        "[{ 'candidate_index': int, 'is_match': bool, 'confidence': float, 'reason': '...' }]"
+    )
+    user = (
+        f"TARGET PRODUCT: {product.name} | Brand: {product.brand} | "
+        f"Category: {product.category} | Attributes: {', '.join(attributes)} | "
+        f"Target Price: {product.target_price} {product.currency}\n\nCANDIDATES:\n"
+        + "\n".join(f"[{i}] Title: '{c.get('title','')}' | Price: {c.get('price','')} | "
+                    f"Merchant: {c.get('merchant','')} | URL: {c.get('url','')}"
+                    for i, c in enumerate(normalized))
+        + "\n\nFor each candidate, judge if valid match."
+    )
+    result = await llm.chat(system, user)
+    latency = (time.time() - start) * 1000
+    parsed = None
+    parse_ok = False
+    judgments = []
+    try:
+        parsed = json.loads(result["content"])
+        judgments = parsed if isinstance(parsed, list) else parsed.get("judgments", [])
+        parse_ok = True
+    except json.JSONDecodeError:
+        judgments = []
+
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
+        "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
+        "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
+        "valid_match_count": sum(1 for j in judgments if j.get("is_match")),
+        "metadata": {"judgments": judgments},
+    }
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="llm_judge", metadata={"run_id": run_id, "product_id": str(product.id)})
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "llm_judge", log_data)
+    return {"judgments": judgments, "latency_ms": latency}
+
+
+# ───────────────────────────── Agent 7: scoring_engine (deterministic) ─────────────────────────────
+
+def agent_scoring_engine(product: Product, normalized: list[dict], judgments: list[dict]) -> list[dict]:
+    scored = []
+    for i, candidate in enumerate(normalized):
+        judgment = next((j for j in judgments if j.get("candidate_index") == i), None)
+        if not judgment or not judgment.get("is_match"):
+            continue
+        raw_price = candidate.get("price", 0)
+        try:
+            price = float(raw_price) if raw_price else 0
+        except (ValueError, TypeError):
+            price = 0
+        target = product.target_price or price
+
+        price_ratio = price / target if target > 0 else 1.0
+        price_score = max(0, 1.0 - abs(1.0 - price_ratio) * 0.5)
+
+        trust_scores = {"amazon": 0.9, "walmart": 0.85, "bestbuy": 0.9,
+                        "target": 0.85, "newegg": 0.8, "ebay": 0.6}
+        trust_score = trust_scores.get(str(candidate.get("merchant", "")).lower(), 0.5)
+        relevance_score = judgment.get("confidence", 0.5)
+        score = 0.4 * price_score + 0.3 * relevance_score + 0.3 * trust_score
+
+        scored.append({
+            "candidate_index": i,
+            "title": candidate.get("title"),
+            "price": price,
+            "currency": candidate.get("currency", "USD"),
+            "merchant": candidate.get("merchant"),
+            "url": candidate.get("url"),
+            "price_score": round(price_score, 3),
+            "relevance_score": round(relevance_score, 3),
+            "trust_score": round(trust_score, 3),
+            "score": round(score, 3),
+        })
+    return sorted(scored, key=lambda x: x["score"], reverse=True)
+
+
+# ───────────────────────────── Agent 8: reflection_agent ─────────────────────────────
+
+async def agent_reflection(llm: Any, product: Product, candidate_count: int, valid_count: int,
+                           scored: list[dict], target_price: float | None, run_id: str, iteration: int) -> dict:
+    start = time.time()
+    system = (
+        "You are a quality assurance analyst for competitive pricing data. Evaluate analysis results "
+        "for quality and completeness. Check for: Price outliers (any price > 5x or < 0.2x target price "
+        "→ flag), Semantic relevance (are matched products actually comparable?), Coverage (enough matches "
+        "for market analysis?). Output JSON: { 'quality_score': 0.0-1.0, 'needs_reformulation': bool, "
+        "'issues': [...], 'confidence': 0.0-1.0 }. Only set needs_reformulation=true if quality_score < 0.5 "
+        "and fewer than 2 valid matches."
+    )
+    user = (
+        f"Product: {product.name} ({product.brand or 'N/A'})\n"
+        f"Target Price: {target_price} {product.currency}\n"
+        f"Candidates Found: {candidate_count}\nValid Matches: {valid_count}\n\n"
+        f"Scored Competitors:\n"
+        + "\n".join(f"- {s['title']} | {s['merchant']} | {s['price']} {s['currency']} | Score: {s['score']}"
+                    for s in scored)
+        + "\n\nEvaluate quality. Should queries be reformulated?"
+    )
+    result = await llm.chat(system, user)
+    latency = (time.time() - start) * 1000
+    parsed = None
+    parse_ok = False
+    try:
+        parsed = json.loads(result["content"])
+        parse_ok = True
+    except json.JSONDecodeError:
+        parsed = {"quality_score": 0.3, "needs_reformulation": True, "issues": ["parse error"], "confidence": 0.3}
+
+    needs_reform = parsed.get("needs_reformulation", False)
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
+        "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
+        "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
+        "metadata": {"quality_score": parsed.get("quality_score"), "needs_reformulation": needs_reform, "issues": parsed.get("issues")},
+    }
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="reflection_agent", metadata={"run_id": run_id, "product_id": str(product.id)})
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "reflection_agent", log_data)
+    return {"quality_score": parsed.get("quality_score"), "needs_reformulation": needs_reform,
+            "issues": parsed.get("issues", []), "latency_ms": latency}
+
+
+# ───────────────────────────── Agent 9: query_reformulator ─────────────────────────────
+
+async def agent_query_reformulator(llm: Any, product: Product, previous_queries: list[str],
+                                   issues: list[str], attributes: list, run_id: str, iteration: int) -> dict:
+    start = time.time()
+    system = (
+        "You are a search query optimization specialist. Given a product and the results from previous queries, "
+        "generate improved queries to find better competitor data. Rules: Analyze why previous queries failed. "
+        "Generate 3 new queries that address identified gaps. Vary phrasing: add synonyms, remove brand if too "
+        "restrictive, add category terms. Output JSON: { 'previous_issues': [...], 'new_queries': ['...','...','...'], "
+        "'strategy': '...' }"
+    )
+    user = (
+        f"Product: {product.name}\nBrand: {product.brand or 'N/A'}\n"
+        f"Category: {product.category or 'N/A'}\n"
+        f"Attributes: {', '.join(attributes) if attributes else 'N/A'}\n\n"
+        f"Previous Queries:\n" + "\n".join(f"- '{q}'" for q in previous_queries) + "\n"
+        f"Issues: " + "; ".join(issues) + "\n\nGenerate 3 improved queries."
+    )
+    result = await llm.chat(system, user)
+    latency = (time.time() - start) * 1000
+    parsed = None
+    parse_ok = False
+    new_queries = []
+    try:
+        parsed = json.loads(result["content"])
+        new_queries = parsed.get("new_queries", [])
+        parse_ok = True
+    except json.JSONDecodeError:
+        new_queries = [product.name + " price"]
+
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
+        "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
+        "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
+        "metadata": {"new_queries": new_queries, "strategy": parsed.get("strategy") if parsed else ""},
+    }
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="query_reformulator", metadata={"run_id": run_id, "product_id": str(product.id)})
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "query_reformulator", log_data)
+    return {"queries": new_queries, "latency_ms": latency}
+
+
+# ───────────────────────────── Agent 10: market_analyst_agent ─────────────────────────────
+
+async def agent_market_analyst(llm: Any, product: Product, scored: list[dict], valid_count: int,
+                               iteration_count: int, run_id: str, iteration: int) -> dict:
+    start = time.time()
+    system = (
+        "You are a senior market intelligence analyst. Produce a competitive pricing analysis report. "
+        "RULES: Every claim about a competitor's price MUST include the source URL. Do not speculate on "
+        "pricing trends without data. If insufficient data (< 2 competitors), state "
+        "'Insufficient data for market analysis'. Price recommendations must reference specific competitor prices. "
+        "Output must be valid JSON with sections: market_overview, competitor_table, price_analysis, recommendation, confidence."
+    )
+    user = (
+        f"Product: {product.name}\nBrand: {product.brand}\nCategory: {product.category}\n"
+        f"Our Target Price: {product.target_price} {product.currency}\n"
+        f"Valid Competitors Found: {valid_count}\nTotal Iterations: {iteration_count}\n\n"
+        + (f"Competitor Data:\n" +
+           "\n".join(f"| {s['title'][:30]} | {s['price']} | {s['merchant']} | {s['score']} | {s['url']} |"
+                     for s in scored[:10])
+           if scored else "No competitors found.")
+        + "\n\nProduce market analysis with recommendations."
+    )
+    result = await llm.chat(system, user)
+    latency = (time.time() - start) * 1000
+    parsed = None
+    parse_ok = False
+    try:
+        parsed = json.loads(result["content"])
+        parse_ok = True
+    except json.JSONDecodeError:
+        parsed = {"market_overview": "Analysis failed", "competitor_table": [],
+                   "price_analysis": "N/A", "recommendation": "N/A", "confidence": 0}
+
+    log_data = {
+        "iteration_number": iteration, "latency_ms": latency,
+        "input_tokens": result.get("input_tokens"), "output_tokens": result.get("output_tokens"),
+        "estimated_cost": estimate_cost(result.get("model", ""), result.get("input_tokens", 0), result.get("output_tokens", 0)),
+        "model_name": result.get("model"), "prompt_version": "1.0", "json_parse_success": parse_ok,
+        "metadata": {"analysis_summary": {k: v for k, v in parsed.items() if k != "competitor_table"}},
+    }
+    async with async_session_factory() as db:
+        trace_id = str(uuid.uuid4())
+        if langfuse:
+            langfuse.trace(id=trace_id, name="market_analyst_agent", metadata={
+                "run_id": run_id, "product_id": str(product.id), "final_decision": parsed
+            })
+        log_data["span_id"] = trace_id
+        await _create_agent_log(db, run_id, "market_analyst_agent", log_data)
+    return {"analysis": parsed, "latency_ms": latency}
+
+
+# ───────────────────────────── Main Orchestration Task ─────────────────────────────
+
+@celery_app.task(bind=True, name="analyze_product", max_retries=3)
+def analyze_product(self, product_id: str, run_id: str):
+    import asyncio
+    asyncio.run(_run_analysis(product_id, run_id))
+
+
+@celery_app.task(bind=True, name="track_all_prices", max_retries=3)
+def track_all_prices(self):
+    import asyncio
+    asyncio.run(_track_all_prices())
+
+
+@celery_app.task(bind=True, name="check_price_alerts", max_retries=3)
+def check_price_alerts(self):
+    import asyncio
+    asyncio.run(_check_alerts())
+
+
+async def _run_analysis(product_id: str, run_id: str):
+    start_total = time.time()
+    llm = get_llm_client()
+
+    async with async_session_factory() as db:
+        await _update_analysis(db, run_id, status=AnalysisStatus.running, started_at=datetime.utcnow())
+        product = await db.get(Product, product_id)
+        if not product:
+            await _update_analysis(db, run_id, status=AnalysisStatus.failed, error_message="Product not found")
+            return
+
+    # Agent 1: Product Understanding
+    a1 = await agent_product_understanding(llm, product, run_id, iteration=1)
+    attributes = a1.get("parsed", {}).get("attributes", [])
+
+    # Agent 2: Query Generator
+    a2 = await agent_query_generator(llm, product, attributes, run_id, iteration=1)
+    queries = a2["queries"]
+
+    all_raw_candidates = []
+    all_normalized = []
+    all_judgments = []
+    scored = []
+    iteration = 1
+    max_iterations = 3
+
+    while iteration <= max_iterations:
+        # Agent 3 & 4: Search in parallel
+        serpapi_results = await agent_serpapi_search(queries, run_id, iteration)
+        tavily_results = await agent_tavily_search(queries, run_id, iteration)
+
+        raw_candidates = serpapi_results + tavily_results
+        all_raw_candidates.extend(raw_candidates)
+
+        if not raw_candidates:
+            iteration += 1
+            if iteration > max_iterations:
+                break
+            a9 = await agent_query_reformulator(llm, product, queries, ["no results"], attributes, run_id, iteration)
+            queries = a9["queries"]
+            continue
+
+        # Agent 5: Normalize
+        a5 = await agent_candidate_normalizer(llm, product, raw_candidates, run_id, iteration)
+        normalized = a5["normalized"]
+        all_normalized.extend(normalized)
+
+        if not normalized:
+            iteration += 1
+            if iteration > max_iterations:
+                break
+            a9 = await agent_query_reformulator(llm, product, queries, ["no valid candidates after normalization"], attributes, run_id, iteration)
+            queries = a9["queries"]
+            continue
+
+        # Agent 6: Judge
+        a6 = await agent_llm_judge(llm, product, normalized, attributes, run_id, iteration)
+        judgments = a6["judgments"]
+        all_judgments.extend(judgments)
+
+        # Agent 7: Score (deterministic)
+        scored = agent_scoring_engine(product, normalized, judgments)
+        valid_count = len(scored)
+
+        # Agent 8: Reflect
+        a8 = await agent_reflection(llm, product, len(normalized), valid_count, scored,
+                                     product.target_price, run_id, iteration)
+
+        if not a8["needs_reformulation"] or iteration >= max_iterations:
+            break
+
+        # Agent 9: Reformulate
+        a9 = await agent_query_reformulator(llm, product, queries, a8["issues"], attributes, run_id, iteration)
+        queries = a9["queries"]
+        iteration += 1
+
+    # Agent 10: Market Analysis
+    a10 = await agent_market_analyst(llm, product, scored, len(scored), iteration, run_id, iteration=iteration)
+
+    total_latency = (time.time() - start_total) * 1000
+    best = scored[0] if scored else None
+
+    # Save results to DB
+    async with async_session_factory() as db:
+        await _update_analysis(db, run_id,
+            status=AnalysisStatus.completed,
+            completed_at=datetime.utcnow(),
+            total_latency_ms=total_latency,
+            candidate_count=len(all_raw_candidates) + len(all_normalized),
+            valid_match_count=len(scored),
+            best_match_price=best["price"] if best else None,
+            best_match_score=best["score"] if best else None,
+            price_confidence=a10.get("analysis", {}).get("confidence"),
+            final_decision=a10.get("analysis"),
+            metadata={"iterations": iteration, "total_queries": queries},
+        )
+
+        # Save valid offers
+        for s in scored:
+            offer = Offer(
+                product_id=product_id,
+                source="analysis",
+                competitor_name=s.get("title", "")[:255],
+                title=s.get("title", ""),
+                price=s.get("price", 0),
+                currency=s.get("currency", "USD"),
+                url=s.get("url", ""),
+                merchant=s.get("merchant"),
+            )
+            db.add(offer)
+
+        # Save price snapshot
+        if best:
+            snap = PriceSnapshot(
+                product_id=product_id,
+                price=best["price"],
+                currency=best.get("currency", "USD"),
+            )
+            db.add(snap)
+        await db.commit()
+
+    await llm.close()
+    logger.info(f"Analysis complete: product={product_id} run={run_id} latency={total_latency:.0f}ms matches={len(scored)}")
+
+
+async def _track_all_prices():
+    logger.info("Running scheduled price tracking for all tracked products")
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(Product).where(Product.is_tracked == True).limit(50)
+        )
+        products = result.scalars().all()
+
+    for product in products:
+        try:
+            run_id = str(uuid.uuid4())
+            async with async_session_factory() as db:
+                run = AnalysisRun(product_id=str(product.id), status=AnalysisStatus.pending,
+                                  metadata={"trigger": "scheduler"})
+                db.add(run)
+                await db.commit()
+                await db.refresh(run)
+            await _run_analysis(str(product.id), str(run.id))
+        except Exception as e:
+            logger.error(f"Price tracking failed for {product.id}: {e}")
+
+
+async def _check_alerts():
+    logger.info("Checking price alerts")
+    async with async_session_factory() as db:
+        # Simple alert: find products with a price drop > 15%
+        result = await db.execute(
+            select(
+                Product.id, Product.name, Product.target_price,
+                PriceSnapshot.price.label("current_price"),
+                PriceSnapshot.snapshot_date
+            )
+            .join(PriceSnapshot, PriceSnapshot.product_id == Product.id)
+            .distinct(Product.id)
+            .order_by(Product.id, PriceSnapshot.snapshot_date.desc())
+            .limit(20)
+        )
+        rows = result.all()
+        for row in rows:
+            if row.target_price and row.current_price:
+                drop_pct = (row.target_price - row.current_price) / row.target_price * 100
+                if drop_pct > 15:
+                    logger.info(f"ALERT: {row.name} dropped {drop_pct:.0f}% (target: {row.target_price}, now: {row.current_price})")
