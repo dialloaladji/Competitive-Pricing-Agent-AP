@@ -45,11 +45,15 @@ async def _update_analysis(db: AsyncSession, run_id: str, **kwargs):
 async def agent_product_understanding(llm: Any, product: Product, run_id: str, iteration: int) -> dict:
     start = time.time()
     system = (
-        "You are a product intelligence specialist. Your task is to analyze a product listing "
-        "and extract structured attributes. You must ONLY extract information explicitly present "
+        "You are an electrical product intelligence specialist. The API is restricted to electrical products only. "
+        "Extract structured attributes from a product listing. You must ONLY extract information explicitly present "
         "in the product description. Do not infer, assume, or fabricate attributes. "
         "If a field is not present in the description, set it to null. "
-        "Output must be valid JSON with keys: name, category, brand, attributes, target_audience, price_indicators."
+        "Pay particular attention to electrical specs: voltage (V), current (A), poles (1P/2P/3P/4P), "
+        "curve (B/C/D/K), breaking capacity (kA), phase (single/three), power (W/kW), mounting (DIN rail/panel), "
+        "standard (IEC 60898, NF C 15-100, UL 489), and usage (residential/commercial/industrial). "
+        "Output must be valid JSON with keys: name, category, brand, sku, product_type, attributes, "
+        "target_audience, price_indicators, specs."
     )
     user = (
         f"Product Name: {product.name}\n"
@@ -57,8 +61,20 @@ async def agent_product_understanding(llm: Any, product: Product, run_id: str, i
         f"Category: {product.category or 'Not specified'}\n"
         f"Brand: {product.brand or 'Not specified'}\n"
         f"SKU: {product.sku or 'Not specified'}\n"
+        f"Product Type: {getattr(product, 'product_type', None) or 'Not specified'}\n"
+        f"Voltage: {getattr(product, 'voltage_v', None) or 'Not specified'} V\n"
+        f"Current: {getattr(product, 'current_a', None) or 'Not specified'} A\n"
+        f"Poles: {getattr(product, 'poles', None) or 'Not specified'}\n"
+        f"Curve: {getattr(product, 'curve', None) or 'Not specified'}\n"
+        f"Breaking Capacity: {getattr(product, 'breaking_capacity_ka', None) or 'Not specified'} kA\n"
+        f"Phase: {getattr(product, 'phase', None) or 'Not specified'}\n"
+        f"Mounting: {getattr(product, 'mounting', None) or 'Not specified'}\n"
+        f"Standard: {getattr(product, 'standard', None) or 'Not specified'}\n"
+        f"Usage: {getattr(product, 'usage', None) or 'Not specified'}\n"
         f"Target Price: {product.target_price} {product.currency}\n\n"
-        "Extract: name, category, brand, key attributes, target audience, any price-related indicators."
+        "Extract: name, category, brand, sku, product_type, key electrical attributes, "
+        "target audience (e.g. residential installers, panel builders, industrial B2B), "
+        "price_indicators, and a specs object with the electrical fields where present."
     )
     result = await llm.chat(system, user)
     latency = (time.time() - start) * 1000
@@ -93,25 +109,31 @@ async def agent_product_understanding(llm: Any, product: Product, run_id: str, i
 async def agent_query_generator(llm: Any, product: Product, attributes: list, run_id: str, iteration: int) -> dict:
     start = time.time()
     system = (
-        "You are a competitive research query strategist. Generate search queries to find competing "
-        "products on Google Shopping and the web.\n\n"
+        "You are a competitive research query strategist specialized in ELECTRICAL PRODUCTS. "
+        "Generate search queries to find competing electrical products on Google Shopping, B2B "
+        "distributor sites (Rexel, Sonepar, 123elec, Legallais), and the web.\n\n"
         "Generate TWO types of queries:\n"
-        "1. GENERIC queries (without brand name) — to find competitors from other brands. "
-        "Use product category and attributes only. E.g. 'wireless noise cancelling headphones' "
-        "instead of 'Sony WH-1000XM5'.\n"
+        "1. GENERIC queries (without brand name) — to find competitors from other electrical "
+        "manufacturers. Use the product type and electrical specs (voltage, current, poles, "
+        "curve, kA). E.g. 'MCB 1P 16A curve C 6kA DIN rail' instead of 'ABB S201-C16'.\n"
         "2. BRAND-SPECIFIC queries (with brand name) — to find the exact product on different "
-        "marketplaces/platforms. E.g. 'Sony WH-1000XM5 buy'.\n\n"
+        "platforms. E.g. 'ABB S201-C16 prix'.\n\n"
+        "Known electrical brands to consider: ABB, Schneider Electric, Legrand, Siemens, Eaton, "
+        "Hager, Chint, Noark, Phoenix Contact, Wago, Finder, Lovato, Mitsubishi, Bticino, Gewiss. "
+        "You may also discover other regional brands (e.g. Crouzet, Klockner Moeller, Telemecanique, "
+        "Merlin Gerin, Square D, ABB Stotz).\n\n"
         "Each query must be a real, specific search string a human would type. "
-        "Do not invent competitor names. Max 6 queries (3 generic, 3 brand-specific). "
+        "Max 6 queries (3 generic, 3 brand-specific). "
         "Output JSON: { 'queries': ['...', '...'] }"
     )
     user = (
         f"Product: {product.name}\nBrand: {product.brand or 'N/A'}\n"
         f"Category: {product.category or 'N/A'}\n"
-        f"Key Attributes: {', '.join(attributes) if attributes else 'N/A'}\n"
+        f"SKU: {getattr(product, 'sku', None) or 'N/A'}\n"
+        f"Key Electrical Attributes: {', '.join(attributes) if attributes else 'N/A'}\n"
         f"Target Price: {product.target_price} {product.currency}\n\n"
-        "Generate up to 6 queries: half without brand (to find other brands), "
-        "half with brand (to find same product on different platforms)."
+        "Generate up to 6 queries: 3 generic (no brand, focus on type and specs) and 3 brand-specific "
+        "(find same product on different platforms or distributors)."
     )
     result = await llm.chat(system, user)
     latency = (time.time() - start) * 1000
@@ -196,19 +218,28 @@ async def agent_tavily_search(queries: list[str], run_id: str, iteration: int) -
 async def agent_candidate_normalizer(llm: Any, product: Product, raw_candidates: list[dict], run_id: str, iteration: int) -> dict:
     start = time.time()
     system = (
-        "You are a data normalization expert. Normalize competitor offer data from various sources "
+        "You are a data normalization expert for ELECTRICAL PRODUCT offers. Normalize competitor data "
         "into a unified schema. Rules: Only transform fields that exist in the input. Do not generate "
-        "prices, URLs, or merchant names. Deduplicate by URL (same URL = same offer). "
-        "Standardize currency to ISO 4217. Output JSON array of normalized offers."
+        "prices, URLs, or merchant names. Deduplicate by URL (same URL = same offer). Standardize currency "
+        "to ISO 4217 (EUR for European B2B offers). Extract the BRAND from the title (Schneider, Legrand, "
+        "ABB, Siemens, Hager, Eaton, Chint, Noark, Phoenix Contact, etc.). Reject candidates outside the "
+        "electrical domain (consumer electronics, headphones, household appliances, food, clothing, etc.).\n\n"
+        "For each candidate, also extract electrical specs if present in title/description: "
+        "voltage_v, current_a, poles (1/2/3/4), curve (B/C/D/K), breaking_capacity_ka, phase, mounting. "
+        "Include a 'specs' dict in each normalized candidate.\n\n"
+        "Output JSON array of normalized_candidates."
     )
     candidates_for_llm = raw_candidates[:30]
     user = (
-        f"Target Product: {product.name} ({product.brand or 'N/A'})\n\nRaw candidates ({len(raw_candidates)} total, showing first {len(candidates_for_llm)}):\n"
+        f"Target Product: {product.name} ({product.brand or 'N/A'})\n"
+        f"Product Type: {getattr(product, 'product_type', None) or 'N/A'}\n\n"
+        f"Raw candidates ({len(raw_candidates)} total, showing first {len(candidates_for_llm)}):\n"
         + "\n".join(f"[{i+1}] Title: {c.get('title','')} | Price: {c.get('price','')} | "
                     f"URL: {c.get('url','')} | Merchant: {c.get('merchant','N/A')}"
                     for i, c in enumerate(candidates_for_llm))
         + "\n\nNormalize each candidate. Deduplicate by URL. Standardize currency. "
-        "Remove entries with missing price or URL. Output a JSON array of normalized_candidates."
+        "Reject non-electrical products. Extract brand and electrical specs. "
+        "Output a JSON array of normalized_candidates."
     )
     result = await llm.chat(system, user)
     latency = (time.time() - start) * 1000
@@ -243,18 +274,45 @@ async def agent_candidate_normalizer(llm: Any, product: Product, raw_candidates:
 async def agent_llm_judge(llm: Any, product: Product, normalized: list[dict], attributes: list, run_id: str, iteration: int) -> dict:
     start = time.time()
     system = (
-        "You are a competitive market analyst. Identify credible competitive alternatives, "
-        "substitutes, or functional equivalents to the target product.\n\n"
-        "You are NOT looking only for exact product duplicates.\n\n"
-        "IMPORTANT — Prioritize candidates from DIFFERENT BRANDS. "
-        "True competitive benchmarking means finding comparable products from other manufacturers. "
+        "You are a competitive market analyst specialized in ELECTRICAL PRODUCTS. The API is "
+        "restricted to electrical products only (circuit breakers, contactors, switches, cables, "
+        "electrical panels, EV chargers, etc.).\n\n"
+        "Identify credible competitive alternatives to the target electrical product.\n\n"
+        "DOMAIN RULE: If a candidate is NOT an electrical product (e.g. headphones, food, clothing, "
+        "consumer goods, household non-electrical items), classify as 'irrelevant' and REJECT.\n\n"
+        "IMPORTANT — Prioritize candidates from DIFFERENT BRANDS. True competitive benchmarking "
+        "means finding comparable products from other electrical manufacturers (ABB vs Schneider, "
+        "Legrand, Siemens, Eaton, Hager, Chint, Noark, Phoenix Contact, Wago, Finder, Lovato, "
+        "Mitsubishi, Bticino, Gewiss, Crouzet, Telemecanique, Merlin Gerin, Square D, etc.).\n"
         "Same-brand candidates are only relevant if they represent a different price point "
-        "(e.g. cheaper_alternative, premium_alternative) or a different generation.\n\n"
+        "(cheaper_alternative, premium_alternative) or a different generation.\n\n"
         "Evaluate each candidate by asking:\n"
-        "- Does it belong to the same functional category?\n"
-        "- Does it solve the same user need or business use case?\n"
-        "- Are its main features comparable?\n"
+        "- Is it an electrical product?\n"
+        "- Does it belong to the same functional category (protection, contactor, cable, etc.)?\n"
+        "- Are the main electrical specs comparable (voltage, current, poles, breaking capacity)?\n"
+        "- Is it suitable for the same usage (residential, commercial, industrial)?\n"
         "- Is its price in a coherent range?\n\n"
+        "Examples (electrical products):\n"
+        '- Target="ABB S201-C16 MCB 1P 16A curve C 6kA" → '
+        'Competitor="Schneider Easy9 1P 16A C 6kA" → direct_competitor\n'
+        '- Target="ABB S201-C16 MCB 1P 16A C 6kA" → '
+        'Competitor="Legrand RX3 1P 16A C 6kA" → direct_competitor\n'
+        '- Target="ABB S201-C16 MCB" → '
+        'Competitor="Hager MCN116 1P 16A C 6kA" → direct_competitor\n'
+        '- Target="ABB S201-C16 MCB" → '
+        'Competitor="Siemens 5SL6106 1P 16A C 6kA" → premium_alternative (higher price)\n'
+        '- Target="ABB S201-C16 MCB" → '
+        'Competitor="Chint NXB-63 1P 16A C 6kA" → cheaper_alternative\n'
+        '- Target="Schneider LC1D25 contactor 3P 25A" → '
+        'Competitor="ABB AF16 3P 25A contactor" → direct_competitor\n'
+        '- Target="ABB S201-C16 MCB" → '
+        'Competitor="Schneider iC60N 1P 16A C 10kA" → premium_alternative (higher kA)\n'
+        '- Target="ABB S201-C16 MCB" → '
+        'Competitor="Bobine MX 12V pour ABB S200" → accessory_or_part (REJECT)\n'
+        '- Target="ABB S201-C16 MCB" → '
+        'Competitor="Sony WH-1000XM5 headphones" → irrelevant (REJECT, not electrical)\n'
+        '- Target="Legrand 07701 1P 16A" → '
+        'Competitor="Legrand 07700 1P 10A" → functional_equivalent\n\n'
         "CLASSIFY each candidate into one of:\n"
         "- same_product: exact or near-exact match (same brand, same model, possibly different seller)\n"
         "- direct_competitor: very comparable product from a DIFFERENT brand\n"
@@ -264,19 +322,27 @@ async def agent_llm_judge(llm: Any, product: Product, normalized: list[dict], at
         "- previous_generation: older version of same product line\n"
         "- newer_generation: newer version of same product line\n"
         "- accessory_or_part: accessory, spare part, consumable, complementary (REJECT)\n"
-        "- irrelevant: not related (REJECT)\n\n"
+        "- irrelevant: not related OR not an electrical product (REJECT)\n\n"
         "Return strictly valid JSON array:\n"
         '[{"candidate_index": 0, "classification": "direct_competitor", '
         '"confidence": 0.78, "reason": "..."}]'
     )
     user = (
         f"TARGET PRODUCT: {product.name} | Brand: {product.brand} | "
-        f"Category: {product.category} | Attributes: {', '.join(attributes)} | "
+        f"Category: {product.category} | "
+        f"Specs: voltage={getattr(product, 'voltage_v', None)}V, "
+        f"current={getattr(product, 'current_a', None)}A, "
+        f"poles={getattr(product, 'poles', None)}, "
+        f"curve={getattr(product, 'curve', None)}, "
+        f"kA={getattr(product, 'breaking_capacity_ka', None)} | "
+        f"Attributes: {', '.join(attributes)} | "
         f"Target Price: {product.target_price} {product.currency}\n\nCANDIDATES:\n"
-        + "\n".join(f"[{i}] Title: '{c.get('title','')}' | Price: {c.get('price','')} | "
-                    f"Merchant: {c.get('merchant','')} | URL: {c.get('url','')}"
+        + "\n".join(f"[{i}] Title: '{c.get('title','')}' | Brand: {c.get('brand','N/A')} | "
+                    f"Price: {c.get('price','')} | Merchant: {c.get('merchant','')} | "
+                    f"URL: {c.get('url','')}"
                     for i, c in enumerate(normalized))
-        + "\n\nFor each candidate, classify as competitive equivalent, functional equivalent, or reject."
+        + "\n\nFor each candidate, classify as competitive equivalent, functional equivalent, or reject. "
+        "Reject any non-electrical product."
     )
     result = await llm.chat(system, user)
     latency = (time.time() - start) * 1000
@@ -348,9 +414,15 @@ def agent_scoring_engine(product: Product, normalized: list[dict], judgments: li
             reason = str(judgment.get("reason", ""))
 
             if raw_classification in ("accessory_or_part", "irrelevant"):
-                continue
+                det_score = pre.get("deterministic_score", 0)
+                if det_score >= 0.30 and not pre.get("is_accessory", False):
+                    classification = pre.get("classification_hint", "functional_equivalent")
+                    confidence = det_score
+                    reason = "LLM rejected but deterministic score qualifies"
+                else:
+                    continue
 
-            if raw_classification in CLASSIFICATION_CONFIDENCE_THRESHOLDS:
+            elif raw_classification in CLASSIFICATION_CONFIDENCE_THRESHOLDS:
                 min_conf = CLASSIFICATION_CONFIDENCE_THRESHOLDS[raw_classification]
                 if confidence >= min_conf:
                     classification = raw_classification
@@ -360,7 +432,7 @@ def agent_scoring_engine(product: Product, normalized: list[dict], judgments: li
                 classification = "irrelevant"
         else:
             det_score = pre.get("deterministic_score", 0)
-            if det_score >= 0.35 and not pre.get("is_accessory", False):
+            if det_score >= 0.30 and not pre.get("is_accessory", False):
                 classification = pre.get("classification_hint", "functional_equivalent")
                 confidence = det_score
             else:
@@ -377,17 +449,25 @@ def agent_scoring_engine(product: Product, normalized: list[dict], judgments: li
         price_score = max(0, 1.0 - abs(1.0 - price_ratio) * 0.5)
 
         trust_scores = {"amazon": 0.9, "walmart": 0.85, "bestbuy": 0.9,
-                        "target": 0.85, "newegg": 0.8, "ebay": 0.6}
+                        "target": 0.85, "newegg": 0.8, "ebay": 0.6,
+                        "rexel": 0.9, "sonepar": 0.9, "cdiscount": 0.8,
+                        "manomano": 0.85, "leroy merlin": 0.85, "castorama": 0.85,
+                        "planet-bricolage": 0.8, "bricomarche": 0.8,
+                        "123elec": 0.85, "elec-shop": 0.8, "eibmarkt": 0.8,
+                        "distributique": 0.8, "tubesca": 0.75, "domomat": 0.85,
+                        "legallais": 0.9, "cbo": 0.85, "yed": 0.8, "fuseau": 0.8}
         trust_score = trust_scores.get(str(candidate.get("merchant", "")).lower(), 0.5)
 
         det_score = pre.get("deterministic_score", 0)
         score = 0.25 * det_score + 0.35 * confidence + 0.25 * price_score + 0.15 * trust_score
 
+        is_same_brand = pre.get("is_same_brand", False)
+
         scored.append({
             "candidate_index": i,
             "title": candidate.get("title"),
             "price": price,
-            "currency": candidate.get("currency", "USD"),
+            "currency": candidate.get("currency", "EUR"),
             "merchant": candidate.get("merchant"),
             "url": candidate.get("url"),
             "price_score": round(price_score, 3),
@@ -396,6 +476,8 @@ def agent_scoring_engine(product: Product, normalized: list[dict], judgments: li
             "score": round(score, 3),
             "classification": classification,
             "deterministic_score": det_score,
+            "is_same_brand": is_same_brand,
+            "specs": candidate.get("specs", {}),
         })
     scored.sort(key=lambda x: x["score"], reverse=True)
     for i, s in enumerate(scored):

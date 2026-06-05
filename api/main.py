@@ -228,8 +228,20 @@ async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depend
         _create_agent_log, _update_analysis,
     )
     from api.llm_client import get_llm_client
-    from worker.scoring import deterministic_pre_score
+    from worker.scoring import deterministic_pre_score, _is_electrical, ELECTRICAL_BRANDS
     from api.schemas import VALID_CLASSIFICATIONS
+
+    product_text = f"{data.name} {data.description} {data.sku or ''} {data.brand or ''} {data.product_type or ''} {data.standard or ''}"
+    if not _is_electrical(product_text):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This API is specialized for electrical products only. "
+                "Please submit an electrical product (circuit breaker, contactor, switch, "
+                "cable, electrical panel, contactor, contactor, etc.) from a brand such as "
+                f"{', '.join(ELECTRICAL_BRANDS[:6])}."
+            ),
+        )
 
     start_total = time.time()
     product = Product(**data.model_dump(exclude={"max_iterations"}))
@@ -435,6 +447,19 @@ async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depend
     finally:
         await llm.close()
 
+    cross_brand_list = [s for s in scored if not s.get("is_same_brand", False)]
+    same_brand_list = [s for s in scored if s.get("is_same_brand", False)]
+
+    def _to_out(s: dict) -> EquivalentOut:
+        return EquivalentOut(
+            title=s["title"], price=s["price"], currency=s.get("currency", "EUR"),
+            merchant=s.get("merchant"), brand=s.get("brand"), url=s.get("url", ""),
+            score=s["score"], price_score=s["price_score"],
+            relevance_score=s["relevance_score"], trust_score=s["trust_score"],
+            classification=s.get("classification", "unknown"),
+            specs=s.get("specs", {}),
+        )
+
     return AnalyzeEquivalentsResponse(
         product_id=product_id,
         product_name=product.name,
@@ -442,20 +467,14 @@ async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depend
         total_latency_ms=total_latency,
         candidate_count=run.candidate_count or 0,
         valid_match_count=len(scored),
+        cross_brand_count=len(cross_brand_list),
+        same_brand_count=len(same_brand_list),
         best_match_price=best["price"] if best else None,
         best_match_score=best["score"] if best else None,
         price_confidence=analysis.get("confidence"),
         recommendation=recommendation,
-        equivalents=[
-            EquivalentOut(
-                title=s["title"], price=s["price"], currency=s.get("currency", "USD"),
-                merchant=s.get("merchant"), brand=s.get("brand"), url=s.get("url", ""),
-                score=s["score"], price_score=s["price_score"],
-                relevance_score=s["relevance_score"], trust_score=s["trust_score"],
-                classification=s.get("classification", "unknown"),
-            )
-            for s in scored
-        ],
+        cross_brand_equivalents=[_to_out(s) for s in cross_brand_list],
+        same_brand_listings=[_to_out(s) for s in same_brand_list],
     )
 
 

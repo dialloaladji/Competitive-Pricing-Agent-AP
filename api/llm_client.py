@@ -15,60 +15,111 @@ GROQ_PRICES = {
 }
 
 MOCK_PRODUCT_UNDERSTANDING = {
-    "name": "Generic Target Product", "category": "General",
-    "brand": "Generic Brand",
-    "attributes": ["standard", "general purpose"],
-    "target_audience": "consumers",
-    "price_indicators": {"msrp": 100.00}
+    "name": "ABB S201-C16 MCB 1P 16A",
+    "category": "circuit_breaker",
+    "brand": "ABB",
+    "sku": "S201-C16",
+    "product_type": "mcb_1p_c_16a",
+    "attributes": [
+        "MCB", "1P (single pole)", "16A rated current", "Curve C",
+        "6kA breaking capacity", "230V rated voltage", "DIN rail mounting",
+        "IEC 60898", "Residential/commercial usage",
+    ],
+    "target_audience": "electrical installers, panel builders, distributors",
+    "price_indicators": {"msrp_eur": 8.50, "trade_price_eur": 6.50, "tier": "budget-mid"},
+    "specs": {
+        "voltage_v": 230,
+        "current_a": 16,
+        "poles": 1,
+        "curve": "C",
+        "breaking_capacity_ka": 6.0,
+        "phase": "single",
+        "mounting": "din_rail",
+        "standard": "IEC 60898",
+        "usage": "residential",
+    },
 }
+
 MOCK_QUERIES = {
     "queries": [
-        "wireless noise cancelling headphones",
-        "over ear bluetooth headphones ANC",
-        "premium wireless headphones 2025",
-        "SoundPro wireless headphones buy",
-        "SoundPro WH-1000 price",
-        "SoundPro vs Bose vs Sony"
+        "MCB 1P 16A curve C 6kA DIN rail",
+        "disjoncteur modulaire 1P 16A courbe C 6kA",
+        "Schneider Easy9 1P 16A curve C disjoncteur",
+        "Legrand RX³ 1P 16A disjoncteur courbe C",
+        "Hager MCN116 1P 16A disjoncteur modulaire",
+        "Siemens 5SL6106 1P 16A MCB",
     ]
 }
+
 MOCK_CANDIDATES = [
-    {"title": "SoundPro Wireless Headphones", "price": 69.99, "currency": "USD",
-     "url": "https://example.com/1", "merchant": "Amazon", "source": "serpapi"},
-    {"title": "SoundPro Bluetooth 5.3 Headset", "price": 74.99, "currency": "USD",
-     "url": "https://example.com/2", "merchant": "Walmart", "source": "serpapi"},
-    {"title": "Bose QuietComfort 45 Wireless ANC Headphones", "price": 329.00, "currency": "USD",
-     "url": "https://example.com/3", "merchant": "Best Buy", "source": "serpapi"},
-    {"title": "Sony WH-1000XM5 Wireless Noise Cancelling", "price": 349.99, "currency": "USD",
-     "url": "https://example.com/4", "merchant": "Amazon", "source": "serpapi"},
-    {"title": "Sennheiser Momentum 4 Wireless ANC Headphones", "price": 349.95, "currency": "USD",
-     "url": "https://example.com/5", "merchant": "Amazon", "source": "tavily"},
-    {"title": "Audio-Technica ATH-M50xBT2 Wireless", "price": 199.00, "currency": "USD",
-     "url": "https://example.com/6", "merchant": "B&H", "source": "tavily"},
-    {"title": "Anker Soundcore Space Q45 ANC Headphones", "price": 149.99, "currency": "USD",
-     "url": "https://example.com/7", "merchant": "Amazon", "source": "serpapi"},
-    {"title": "Case for SoundPro Headphones - Hard Shell", "price": 24.99, "currency": "USD",
-     "url": "https://example.com/8", "merchant": "eBay", "source": "tavily"},
+    {"title": "Schneider Electric Easy9 1P 16A Courbe C 6kA Disjoncteur modulaire",
+     "price": 8.50, "currency": "EUR", "url": "https://example.com/schneider-easy9",
+     "merchant": "Rexel", "source": "serpapi", "brand": "Schneider Electric",
+     "specs": {"voltage_v": 230, "current_a": 16, "poles": 1, "curve": "C", "breaking_capacity_ka": 6.0}},
+    {"title": "Legrand RX³ 1P 16A Courbe C 6000A Disjoncteur modulaire",
+     "price": 7.80, "currency": "EUR", "url": "https://example.com/legrand-rx3",
+     "merchant": "Sonepar", "source": "serpapi", "brand": "Legrand",
+     "specs": {"voltage_v": 230, "current_a": 16, "poles": 1, "curve": "C", "breaking_capacity_ka": 6.0}},
+    {"title": "Hager MCN116 1P 16A Disjoncteur modulaire 6kA Courbe C",
+     "price": 9.20, "currency": "EUR", "url": "https://example.com/hager-mcn",
+     "merchant": "Rexel", "source": "tavily", "brand": "Hager",
+     "specs": {"voltage_v": 230, "current_a": 16, "poles": 1, "curve": "C", "breaking_capacity_ka": 6.0}},
+    {"title": "Siemens 5SL6106-6 1P 16A MCB Curve C 6kA",
+     "price": 12.50, "currency": "EUR", "url": "https://example.com/siemens-5sl",
+     "merchant": "Sonepar", "source": "tavily", "brand": "Siemens",
+     "specs": {"voltage_v": 230, "current_a": 16, "poles": 1, "curve": "C", "breaking_capacity_ka": 6.0}},
+    {"title": "ABB S201-C16 1P 16A Courbe C 6kA Disjoncteur",
+     "price": 7.95, "currency": "EUR", "url": "https://example.com/abb-s201",
+     "merchant": "Rexel", "source": "serpapi", "brand": "ABB",
+     "specs": {"voltage_v": 230, "current_a": 16, "poles": 1, "curve": "C", "breaking_capacity_ka": 6.0}},
+    {"title": "Chint NXB-63 1P 16A Courbe C 6kA Disjoncteur",
+     "price": 4.20, "currency": "EUR", "url": "https://example.com/chint-nxb",
+     "merchant": "123elec", "source": "tavily", "brand": "Chint",
+     "specs": {"voltage_v": 230, "current_a": 16, "poles": 1, "curve": "C", "breaking_capacity_ka": 6.0}},
+    {"title": "Noark NMB1-63 1P 16A MCB Curve C 6kA",
+     "price": 3.80, "currency": "EUR", "url": "https://example.com/noark-nmb",
+     "merchant": "Eibmarkt", "source": "tavily", "brand": "Noark",
+     "specs": {"voltage_v": 230, "current_a": 16, "poles": 1, "curve": "C", "breaking_capacity_ka": 6.0}},
+    {"title": "Bobine de déclenchement MX 12V pour disjoncteur ABB S200",
+     "price": 24.99, "currency": "EUR", "url": "https://example.com/bobine-abb",
+     "merchant": "123elec", "source": "tavily", "brand": "ABB",
+     "specs": {"voltage_v": 12, "current_a": 0, "poles": 0}},
 ]
+
 MOCK_JUDGMENT = [
-    {"candidate_index": 0, "classification": "same_product", "confidence": 0.92,
-     "reason": "Exact product match"},
-    {"candidate_index": 1, "classification": "direct_competitor", "confidence": 0.85,
-     "reason": "Same brand, comparable specs"},
-    {"candidate_index": 2, "classification": "functional_equivalent", "confidence": 0.72,
-     "reason": "Different brand but same category and features"},
-    {"candidate_index": 3, "classification": "cheaper_alternative", "confidence": 0.65,
-     "reason": "Lower price, same functional category"},
-    {"candidate_index": 4, "classification": "accessory_or_part", "confidence": 0.90,
-     "reason": "This is a case/cover for the product, not a competitor"},
+    {"candidate_index": 0, "classification": "direct_competitor", "confidence": 0.92,
+     "reason": "Schneider Easy9 1P 16A C 6kA is direct cross-brand competitor with identical specs"},
+    {"candidate_index": 1, "classification": "direct_competitor", "confidence": 0.90,
+     "reason": "Legrand RX3 1P 16A C 6kA - direct cross-brand equivalent"},
+    {"candidate_index": 2, "classification": "direct_competitor", "confidence": 0.88,
+     "reason": "Hager MCN116 1P 16A C 6kA - direct cross-brand competitor"},
+    {"candidate_index": 3, "classification": "premium_alternative", "confidence": 0.82,
+     "reason": "Siemens 5SL6106 1P 16A C 6kA - premium cross-brand equivalent at higher price"},
+    {"candidate_index": 4, "classification": "same_product", "confidence": 0.95,
+     "reason": "Exact ABB S201-C16 same model, same brand"},
+    {"candidate_index": 5, "classification": "cheaper_alternative", "confidence": 0.78,
+     "reason": "Chint NXB-63 cheaper alternative from Chinese brand, same functional specs"},
+    {"candidate_index": 6, "classification": "cheaper_alternative", "confidence": 0.75,
+     "reason": "Noark NMB1-63 budget alternative with same specs"},
+    {"candidate_index": 7, "classification": "accessory_or_part", "confidence": 0.95,
+     "reason": "Bobine de déclenchement is an accessory for ABB S200 series, not a competitor"},
 ]
-MOCK_REFLECTION = {"quality_score": 0.8, "needs_reformulation": False, "issues": [], "confidence": 0.85}
-MOCK_QUERIES_REFORMULATED = {"previous_issues": ["queries too narrow"], "new_queries": ["wireless headphones deals", "noise cancelling headphones price comparison"], "strategy": "broaden search"}
+
+MOCK_REFLECTION = {"quality_score": 0.9, "needs_reformulation": False, "issues": [], "confidence": 0.85}
+MOCK_QUERIES_REFORMULATED = {
+    "previous_issues": ["need more cross-brand candidates"],
+    "new_queries": ["MCB 16A Schneider Legrand Hager prix", "disjoncteur modulaire 16A alternatif"],
+    "strategy": "broaden to multiple competing brands"
+}
 MOCK_MARKET_ANALYSIS = {
-    "market_overview": "3 competitors found for SoundPro Wireless Headphones.",
-    "competitor_table": [{"competitor": "Amazon - SoundPro", "price": 69.99, "score": 0.92}],
-    "price_analysis": "Best price found at $69.99, 12.5% below target of $79.99",
-    "recommendation": "Price at $74.99 to stay competitive while maintaining margin.",
-    "confidence": 0.85
+    "market_overview": "Strong cross-brand competition for MCB 1P 16A 6kA segment with 4 direct equivalents (Schneider, Legrand, Hager, Siemens) plus 2 budget alternatives (Chint, Noark).",
+    "competitor_table": [
+        {"competitor": "Schneider Easy9", "price": 8.50, "score": 0.92, "merchant": "Rexel"},
+        {"competitor": "Legrand RX3", "price": 7.80, "score": 0.90, "merchant": "Sonepar"},
+    ],
+    "price_analysis": "Cross-brand range: €3.80-€12.50. ABB S201-C16 (€7.95) is positioned mid-range. Budget alternatives 50% cheaper. Premium Siemens 57% above.",
+    "recommendation": "ABB S201-C16 at €7.95 is competitive mid-range. Consider €7.50 to undercut Legrand RX3 by 4% while maintaining margin. Below €5 would signal race to bottom with Chint/Noark.",
+    "confidence": 0.85,
 }
 
 
@@ -177,12 +228,26 @@ class MockClient:
 async def search_tavily(query: str, max_results: int = 3) -> list[dict]:
     if settings.mock_mode:
         return [
-            {"title": "Bose QuietComfort 45 Review - Best ANC Headphones", "url": "https://techblog.com/bose-qc45",
-             "content": "Bose QC45 Wireless Headphones $329 with ANC", "price": 329.00, "merchant": "Best Buy"},
-            {"title": "Sony WH-1000XM5 vs Sennheiser Momentum 4 Comparison", "url": "https://audioblog.com/compare",
-             "content": "Sony WH-1000XM5 $349 vs Sennheiser Momentum 4 $349", "price": 349.00, "merchant": "Amazon"},
-            {"title": "Best Wireless ANC Headphones 2025 Roundup", "url": "https://reviewsite.com/best-anc",
-             "content": "Top picks: Sony, Bose, Sennheiser, Anker Soundcore from $149 to $399", "price": None, "merchant": None},
+            {"title": "Schneider Easy9 1P 16A - Disjoncteur modulaire 6kA",
+             "url": "https://rexel.fr/schneider-easy9-16a",
+             "content": "Schneider Easy9 1P 16A C 6kA MCB - Prix distributeur 8.50 EUR",
+             "price": 8.50, "merchant": "Rexel"},
+            {"title": "Legrand RX3 1P 16A - Disjoncteur courbe C 6kA",
+             "url": "https://sonepar.fr/legrand-rx3-16a",
+             "content": "Legrand RX3 1P 16A C 6kA disjoncteur modulaire - Prix 7.80 EUR",
+             "price": 7.80, "merchant": "Sonepar"},
+            {"title": "Hager MCN116 1P 16A - Disjoncteur modulaire 6kA",
+             "url": "https://rexel.fr/hager-mcn-16a",
+             "content": "Hager MCN116 1P 16A C 6kA - Prix 9.20 EUR",
+             "price": 9.20, "merchant": "Rexel"},
+            {"title": "ABB S201-C16 1P 16A - Disjoncteur 6kA",
+             "url": "https://rexel.fr/abb-s201-c16",
+             "content": "ABB S201-C16 1P 16A C 6kA - Prix 7.95 EUR",
+             "price": 7.95, "merchant": "Rexel"},
+            {"title": "Chint NXB-63 1P 16A - Disjoncteur 6kA",
+             "url": "https://123elec.fr/chint-nxb-63-16a",
+             "content": "Chint NXB-63 1P 16A C 6kA - Prix 4.20 EUR",
+             "price": 4.20, "merchant": "123elec"},
         ]
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
@@ -202,22 +267,27 @@ async def search_tavily(query: str, max_results: int = 3) -> list[dict]:
 async def search_serpapi(query: str, num: int = 5) -> list[dict]:
     if settings.mock_mode:
         return [
-            {"title": "Sony WH-1000XM5 Wireless Noise Cancelling Headphones", "price": 349.99, "currency": "USD",
-             "url": "https://serpapi.com/show?item=1", "merchant": "Amazon", "source": "google_shopping"},
-            {"title": "Bose QuietComfort 45 ANC Headphones Black", "price": 329.00, "currency": "USD",
-             "url": "https://serpapi.com/show?item=2", "merchant": "Best Buy", "source": "google_shopping"},
-            {"title": "Sennheiser Momentum 4 Wireless ANC", "price": 349.95, "currency": "USD",
-             "url": "https://serpapi.com/show?item=3", "merchant": "Amazon", "source": "google_shopping"},
-            {"title": "SoundPro Wireless Headphones WH-1000", "price": 69.99, "currency": "USD",
-             "url": "https://serpapi.com/show?item=4", "merchant": "Walmart", "source": "google_shopping"},
-            {"title": "Anker Soundcore Space Q45 Adaptive ANC", "price": 149.99, "currency": "USD",
-             "url": "https://serpapi.com/show?item=5", "merchant": "Amazon", "source": "google_shopping"},
+            {"title": "Schneider Easy9 1P 16A Courbe C 6kA Disjoncteur modulaire",
+             "price": 8.50, "currency": "EUR", "url": "https://serpapi.com/show?item=1",
+             "merchant": "Rexel", "source": "google_shopping", "brand": "Schneider Electric"},
+            {"title": "Legrand RX3 1P 16A Courbe C 6000A Disjoncteur",
+             "price": 7.80, "currency": "EUR", "url": "https://serpapi.com/show?item=2",
+             "merchant": "Sonepar", "source": "google_shopping", "brand": "Legrand"},
+            {"title": "Hager MCN116 1P 16A Disjoncteur modulaire 6kA",
+             "price": 9.20, "currency": "EUR", "url": "https://serpapi.com/show?item=3",
+             "merchant": "Rexel", "source": "google_shopping", "brand": "Hager"},
+            {"title": "Siemens 5SL6106-6 1P 16A MCB Curve C 6kA",
+             "price": 12.50, "currency": "EUR", "url": "https://serpapi.com/show?item=4",
+             "merchant": "Sonepar", "source": "google_shopping", "brand": "Siemens"},
+            {"title": "ABB S201-C16 1P 16A Courbe C 6kA Disjoncteur",
+             "price": 7.95, "currency": "EUR", "url": "https://serpapi.com/show?item=5",
+             "merchant": "Rexel", "source": "google_shopping", "brand": "ABB"},
         ]
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
             "https://serpapi.com/search",
             params={"engine": "google_shopping", "q": query, "api_key": settings.serpapi_api_key,
-                    "num": num, "gl": "us", "hl": "en"},
+                    "num": num, "gl": "fr", "hl": "fr"},
         )
         resp.raise_for_status()
         data = resp.json()
@@ -225,7 +295,7 @@ async def search_serpapi(query: str, num: int = 5) -> list[dict]:
         for item in data.get("shopping_results", []):
             results.append({
                 "title": item.get("title", ""), "price": item.get("price", ""),
-                "currency": "USD", "url": item.get("link", ""),
+                "currency": "EUR", "url": item.get("link", ""),
                 "merchant": item.get("source", ""), "source": "google_shopping",
             })
         return results
