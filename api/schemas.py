@@ -125,24 +125,20 @@ class DashboardSummary(BaseModel):
 
 
 class EquivalentRequest(BaseModel):
-    name: str
-    description: str = ""
-    sku: str | None = None
-    product_type: str | None = None
+    description: str
     brand: str | None = None
+    sku: str | None = None
+    target_price: float | None = None
+    currency: str = "EUR"
+    max_iterations: int = 1
+    name: str | None = None
+    category: str | None = None
     voltage_v: int | None = None
     current_a: int | None = None
     poles: int | None = None
     curve: str | None = None
     breaking_capacity_ka: float | None = None
     phase: str | None = None
-    power_w: float | None = None
-    mounting: str | None = None
-    standard: str | None = None
-    usage: str | None = None
-    target_price: float | None = None
-    currency: str = "EUR"
-    max_iterations: int = 2
 
 
 VALID_CLASSIFICATIONS = frozenset({
@@ -163,7 +159,10 @@ class EquivalentOut(BaseModel):
     price_score: float
     relevance_score: float
     trust_score: float
+    spec_quality: float = 0.0
+    is_vague: bool = False
     classification: str = "functional_equivalent"
+    spec_match: str = "functional_equivalent"
     specs: dict = Field(default_factory=dict)
 
 
@@ -176,9 +175,16 @@ class AnalyzeEquivalentsResponse(BaseModel):
     valid_match_count: int
     cross_brand_count: int
     same_brand_count: int
+    weak_candidate_count: int
     best_match_price: float | None
     best_match_score: float | None
     price_confidence: float | None
     recommendation: str | None
     cross_brand_equivalents: list[EquivalentOut]
     same_brand_listings: list[EquivalentOut]
+    weak_candidates: list[EquivalentOut]
+    partial_spec_equivalents: list[EquivalentOut] = []
+    partial_spec_count: int = 0
+    brand_diversity_warning: str | None = None
+    brand_diversity_stats: dict | None = None
+    inferred_product: dict | None = None
