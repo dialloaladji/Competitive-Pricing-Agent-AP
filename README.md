@@ -1,102 +1,98 @@
-# AI Electrical Products Competitive Pricing & Market Intelligence
+# Electrical Products Competitive Pricing & Market Intelligence
 
-Real-time competitive pricing analysis for **electrical products only**, powered by LLM agents (Groq/Llama), web search (Tavily/SerpApi), and market intelligence — deployed on Railway.
+Real-time competitive pricing analysis for **electrical products only** — fast, deterministic, no LLM flakiness.
 
 ## Who is it for?
 
 - **Marketing teams** benchmarking their electrical product catalog against competitors
-- **Pricing managers** looking for current market price points on MCBs, contactors, switches, cables, etc.
+- **Pricing managers** looking for current market price points on MCBs, RCDs, contactors, switches, cables, etc.
 - **Category managers** comparing cross-brand offerings (ABB vs Schneider, Legrand, Siemens, Eaton, Hager, etc.)
-- **Marketing directors** who need a quick competitive landscape view
 
 ## Core use case
 
-Given ONE electrical product, find 3-5 equivalent or comparable products from **other brands** and compare prices.
-
-The API focuses on electrical product specifications: product type, brand, reference, voltage, current, poles, curve, breaking capacity, phase, power rating, mounting, standard, residential/commercial/industrial usage.
+Given ONE electrical product description, find **5 cross-brand equivalents** (max 2 per brand, min 3 distinct brands) with deterministic spec matching, scored by spec quality, and priced in EUR.
 
 ## Architecture
 
 ```
-┌────────────────────────────────────────┐
-│            FastAPI Backend             │
-│  POST /api/v1/products/analyze-equiv  │
-│  (synchronous — 10 AI agents in-line) │
-└──────┬───────────────────────────┬─────┘
-       │                           │
-       ▼                           ▼
- ┌──────────┐               ┌──────────┐
- │PostgreSQL│               │  Redis   │
- └──────────┘               └──────────┘
-       ▲                           ▲
-       │                           │
- ┌─────┴─────────────┐   ┌────────┴────────┐
- │  Celery Worker    │   │  Celery Beat    │
- │  (async analysis) │   │  (scheduler)    │
- └───────────────────┘   └─────────────────┘
+┌──────────────────────────────────────────────────────┐
+│            FastAPI Backend (sync endpoint)            │
+│  POST /api/v1/products/analyze-equivalents            │
+│                                                        │
+│  1. Domain gate (electrical only, else HTTP 400)      │
+│  2. Deterministic spec inference (regex-based)         │
+│  3. SerpApi Google Shopping search                     │
+│  4. Deterministic normalization (brand + specs regex)  │
+│  5. Deterministic scoring (5-component weighted score) │
+│  6. Brand diversification (max 2/brand, min 3 brands)  │
+│  7. Optional LLM summarizer (3-5 sentence summary)     │
+│                                                        │
+│  Latency: ~39ms (mock) / ~5-7s (real SerpApi)         │
+└──────────────────────────────────────────────────────┘
 ```
 
-### Services (Railway)
+### Services
+
 | Service | Tech | Port |
 |---|---|---|
-| `api` | FastAPI + Uvicorn | 8000 |
-| `worker` | Celery | — |
-| `scheduler` | Celery Beat | — |
+| `api` | FastAPI + Uvicorn | 8001 |
 | `postgres` | PostgreSQL 16 | 5432 |
-| `redis` | Redis 7 | 6379 |
 
-### AI Agents (10-agent workflow)
-1. **product_understanding_agent** — Extract electrical specs (voltage, current, poles, curve, kA, etc.)
-2. **query_generator_agent** — Generate search queries for electrical brand discovery
-3. **serpapi_search** — Search Google Shopping via SerpApi
-4. **tavily_search** — Web search via Tavily
-5. **candidate_normalizer** — Deduplicate, normalize, extract electrical specs per candidate
-6. **llm_judge** — Validate electrical domain + classify as direct_competitor, premium, cheaper, etc.
-7. **scoring_engine** — Score and rank valid matches (deterministic + LLM)
-8. **reflection_agent** — Evaluate quality, trigger reformulation if needed
-9. **query_reformulator** — Improve search queries for better results
-10. **market_analyst_agent** — Produce final market analysis report
+No Celery/Redis needed — the primary endpoint is **synchronous** and finishes in seconds.
+
+## Pipeline (6 deterministic steps + optional LLM)
+
+1. **Domain gate** — Rejects non-electrical products in <1ms (`_is_electrical`)
+2. **Spec inference** — Extracts brand, category, current, poles, curve, kA, voltage, mounting, sensitivity, differential type from description using regex
+3. **SerpApi search** — Sends description as query to Google Shopping; Tavily as fallback
+4. **Normalization** — URL dedup, price parsing, brand extraction, spec extraction from each candidate title
+5. **Scoring** — 5-component weighted score:
+
+   | Component | Weight |
+   |---|---|
+   | Deterministic pre-score (brand match, similarity) | 0.25 |
+   | Spec quality (current_a, poles, curve, kA, voltage, sensitivity, differential type) | 0.35 |
+   | Price score (closer to target = better) | 0.15 |
+   | Merchant trust (Rexel/Sonepar=0.9, Amazon/Leroy Merlin=0.85, Ebay=0.6) | 0.05 |
+   | Tier-1 brand boost (ABB, Schneider, Legrand, Siemens, Eaton, Hager +0.10) | 0.10 |
+   | Base score | 0.10 |
+
+6. **Brand diversification** — Greedy score-based selection, max 2 per brand, max 5 total, min 3 brands
+7. **Optional LLM summary** — Groq/Llama generates 3-5 sentence competitive landscape summary (only if ≥3 reliable candidates)
 
 ## Quick Start (Local)
 
 ### Prerequisites
 - Python 3.12+
-- Docker Desktop (for Postgres + Redis)
+- Docker Desktop (for Postgres)
 
 ### 1. Start services
 ```bash
-docker compose up -d postgres redis
+docker compose up -d postgres
 ```
 
 ### 2. Configure environment
 ```bash
 cp .env.example .env
-# Edit .env with your API keys (or leave defaults for mock mode)
+# Edit .env with your API keys (or set MOCK_MODE=true for mock data)
 ```
 
-### 3. Install dependencies & seed data
+### 3. Install dependencies & run migrations
 ```bash
 pip install -r requirements.txt
-python scripts/seed.py
+alembic upgrade head
 ```
 
-### 4. Run the stack
+### 4. Run the API
 ```bash
-# Terminal 1 — API
-uvicorn api.main:app --reload --port 8000
-
-# Terminal 2 — Worker
-celery -A worker.celery_app worker --loglevel=info
-
-# Terminal 3 — Scheduler
-celery -A worker.celery_app beat --loglevel=info
+uvicorn api.main:app --reload --port 8001
 ```
 
-> **Note:** The default port 8000 is often occupied by Docker Desktop. Use `--port 8001` if needed.
+Server starts on **http://localhost:8001/docs** (Swagger UI).
 
-### Or run everything with Docker Compose
+### Mock mode (no API keys needed)
 ```bash
-docker compose up --build
+MOCK_MODE=true uvicorn api.main:app --reload --port 8001
 ```
 
 ## API Endpoints
@@ -110,196 +106,137 @@ docker compose up --build
 | `GET` | `/api/v1/products/{id}` | Get product |
 | `PUT` | `/api/v1/products/{id}` | Update product |
 | `DELETE` | `/api/v1/products/{id}` | Delete product |
-| `POST` | `/api/v1/products/analyze-equivalents` | Synchronous AI analysis (electrical products only) |
-| `POST` | `/api/v1/products/{id}/analyze` | Trigger Celery async analysis |
-| `GET` | `/api/v1/products/{id}/analysis` | Analysis history |
-| `GET` | `/api/v1/products/{id}/analysis/latest` | Latest analysis |
+| **`POST`** | **`/api/v1/products/analyze-equivalents`** | **Main endpoint — synchronous analysis** |
+| `POST` | `/api/v1/products/{id}/analyze` | Trigger Celery async analysis (legacy) |
 | `GET` | `/api/v1/products/{id}/offers` | Competitor offers |
 | `GET` | `/api/v1/products/{id}/price-history` | Price snapshots |
 | `GET` | `/api/v1/dashboard/summary` | Dashboard aggregation |
 
-## Request format (electrical product)
+## Request format
 
 ```json
 {
-  "name": "ABB S201-C16",
-  "description": "Disjoncteur modulaire MCB 1P 16A courbe C 6kA",
-  "sku": "S201-C16",
-  "product_type": "mcb_1p_c_16a",
-  "brand": "ABB",
-  "voltage_v": 230,
-  "current_a": 16,
-  "poles": 1,
-  "curve": "C",
-  "breaking_capacity_ka": 6.0,
-  "phase": "single",
-  "mounting": "din_rail",
-  "standard": "IEC 60898",
-  "usage": "residential",
-  "target_price": 8.50,
+  "description": "Disjoncteur Legrand 16A 6kA courbe C Rail DIN",
   "currency": "EUR"
+}
+```
+
+Optional overrides (set to `"string"` or 0 to force re-inference):
+```json
+{
+  "description": "Interrupteur différentiel 2P 40A 30mA type AC",
+  "brand": "string",
+  "category": "string",
+  "current_a": 40,
+  "poles": 2,
+  "sensitivity_ma": 30,
+  "differential_type": "AC"
 }
 ```
 
 ## Response format
 
-The response separates **cross-brand competitors** (the main use case) from **same-brand listings** (for price comparison only).
-
 ```json
 {
-  "product_id": "...",
-  "product_name": "ABB S201-C16",
-  "cross_brand_count": 4,
-  "same_brand_count": 1,
+  "product_id": "uuid",
+  "product_name": "Disjoncteur Legrand 16A 6kA courbe C Rail DIN",
+  "candidate_count": 40,
+  "valid_match_count": 15,
+  "cross_brand_count": 5,
+  "weak_candidate_count": 0,
+  "best_match_price": 8.50,
   "cross_brand_equivalents": [
     {
-      "title": "Schneider Easy9 1P 16A Courbe C 6kA",
+      "title": "Schneider Easy9 1P 16A C 6kA",
       "brand": "Schneider Electric",
       "price": 8.50,
-      "currency": "EUR",
-      "score": 0.85,
-      "classification": "direct_competitor",
+      "score": 0.82,
+      "spec_quality": 0.85,
+      "spec_match": "exact_spec_equivalent",
       "specs": {
-        "voltage_v": 230,
-        "current_a": 16,
-        "poles": 1,
-        "curve": "C",
-        "breaking_capacity_ka": 6.0
+        "current_a": 16, "poles": 1, "curve": "C",
+        "breaking_capacity_ka": 6.0, "mounting": "DIN rail"
       }
-    },
-    {
-      "title": "Legrand RX3 1P 16A Courbe C 6000A",
-      "brand": "Legrand",
-      "price": 7.80,
-      "classification": "direct_competitor"
     }
   ],
-  "same_brand_listings": [
+  "partial_spec_equivalents": [
     {
-      "title": "ABB S201-C16 1P 16A (Rexel)",
-      "price": 7.95,
-      "classification": "same_product"
+      "title": "Legrand 412020 2P 40A 30mA type A",
+      "brand": "Legrand",
+      "price": 52.00,
+      "score": 0.55,
+      "spec_quality": 0.35,
+      "spec_match": "functional_equivalent",
+      "specs": {
+        "current_a": 40, "poles": 2, "sensitivity_ma": 30,
+        "differential_type": "A", "mounting": "DIN rail"
+      }
     }
-  ]
+  ],
+  "same_brand_listings": [],
+  "weak_candidates": [],
+  "inferred_product": {
+    "name": "Disjoncteur Legrand 16A 6kA courbe C Rail DIN",
+    "category": "miniature circuit breaker",
+    "brand": "Legrand",
+    "specs": {
+      "current_a": 16, "curve": "C",
+      "breaking_capacity_ka": 6.0, "mounting": "DIN rail"
+    }
+  },
+  "recommendation": "Competitive landscape summary...",
+  "price_confidence": 0.85
 }
 ```
 
 ## Domain validation
 
-The API is **restricted to electrical products only**. Requests that don't contain an electrical product identifier (brand from the `ELECTRICAL_BRANDS` list or electrical keyword from `ELECTRICAL_KEYWORDS`) are rejected with **HTTP 400** before any API call is made.
+The API is **restricted to electrical products only**. Non-electrical descriptions are rejected with **HTTP 400** before any API call.
 
-Examples of **accepted** products: circuit breakers, contactors, switches, sockets, cables, electrical panels, EV chargers, transformers, fuses, relays, contactors.
+**Accepted:** circuit breakers, RCDs, contactors, switches, cables, electrical panels, EV chargers, transformers, relays, fuses, sockets
 
-Examples of **rejected** products: headphones, food, clothing, generic household items — any non-electrical product returns HTTP 400 immediately.
+**Rejected:** headphones, food, clothing, furniture, toys, automotive parts
 
 ## Supported electrical brands
 
-**Tier 1 (priority):** ABB, Schneider Electric, Legrand, Siemens, Eaton, Hager
+**Tier 1 (boosted +0.10):** ABB, Schneider, Legrand, Siemens, Eaton, Hager
 
-**Tier 2 (mid-range):** Chint, Noark, Phoenix Contact, Wago, Finder, Lovato, Mitsubishi, Bticino, Gewiss
+**Tier 2:** Chint, Noark, Phoenix Contact, Wago, Finder, Lovato, Mitsubishi, Bticino, Gewiss
 
-**Tier 3 (regional/heritage):** Crouzet, Klockner Moeller, Telemecanique, Merlin Gerin, Square D, ABB Stotz, Siemens Sentron, Carlo Gavazzi, HENSEL, Spelsberg, Rittal, Weidmuller
+**Tier 3 (regional/heritage):** Crouzet, Klockner Moeller, Telemecanique, Merlin Gerin, Square D, Carlo Gavazzi, HENSEL, Spelsberg, Rittal, Weidmuller
 
-**Switches & wiring accessories:** Gira, Jung, Berker, Feller, Merten, Siedle, Bals, Walther
+**Switches & wiring:** Gira, Jung, Berker, Feller, Merten, Siedle, Bals, Walther
 
 **Cable & EV:** Nexans, Prysmian, Lapp, Helukabel, Wallbox
-
-## Deploy to Railway
-
-### 1. Create Railway project
-```bash
-railway login
-railway init
-```
-
-### 2. Add plugins
-- **PostgreSQL** — Railway will inject `DATABASE_URL`
-- **Redis** — Railway will inject `REDIS_URL`
-
-### 3. Set environment variables
-```bash
-railway env set LLAMA_CPP_API_KEY=gsk_your_key
-railway env set TAVILY_API_KEY=tvly_your_key
-railway env set SERPAPI_API_KEY=your_key
-railway env set LANGFUSE_PUBLIC_KEY=pk-lf-your-key
-railway env set LANGFUSE_SECRET_KEY=sk-lf-your-key
-```
-
-### 4. Create services
-In Railway dashboard, create 3 services all pointing to the same repo:
-- **api** — `railway run` with target `api`
-- **worker** — `railway run` with target `worker`
-- **scheduler** — `railway run` with target `scheduler`
-
-### 5. Run migrations
-```bash
-railway run alembic upgrade head
-```
 
 ## Environment Variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `DATABASE_URL` | ✅ | — | PostgreSQL async URL |
-| `REDIS_URL` | ✅ | — | Redis URL |
-| `LLAMA_CPP_API_KEY` | ✅ | — | Groq API key |
+| `LLAMA_CPP_API_KEY` | — | — | Groq API key (for summarizer) |
 | `LLAMA_CPP_BASE_URL` | — | `https://api.groq.com/openai/v1` | LLM endpoint |
 | `LLAMA_CPP_MODEL` | — | `llama-3.1-8b-instant` | LLM model |
-| `TAVILY_API_KEY` | ✅ | — | Tavily web search |
 | `SERPAPI_API_KEY` | ✅ | — | SerpApi Google Shopping |
-| `LANGFUSE_PUBLIC_KEY` | — | — | Langfuse observability |
-| `LANGFUSE_SECRET_KEY` | — | — | Langfuse observability |
-| `MOCK_MODE` | — | `false` | Run without API keys (overrides `LLM_PROVIDER`) |
-| `LLM_PROVIDER` | — | `groq` | LLM backend (`groq`, `llamacpp`, `mock`) |
+| `TAVILY_API_KEY` | — | — | Tavily fallback web search |
+| `MOCK_MODE` | — | `false` | Run without API keys |
+| `LLM_PROVIDER` | — | `groq` | LLM backend |
 | `LLM_MAX_TOKENS` | — | `512` | Max LLM response tokens |
-
-## Observability (Langfuse)
-
-Each product analysis creates a Langfuse trace with spans for all 10 agents. Metrics tracked:
-- Latency per agent and end-to-end
-- Token usage and estimated cost
-- JSON parse success rate
-- Match success rate and reflection reformulation rate
-- Price confidence scores
 
 ## Mock Mode
 
-Set `MOCK_MODE=true` to run the full stack without any API keys. All LLM calls and external APIs return realistic electrical-product mock data (ABB, Schneider, Legrand, Hager, Siemens, Chint, Noark). Mock mode is checked **before** `LLM_PROVIDER`, so setting `MOCK_MODE=true` always uses mock clients regardless of the provider setting.
-
-## Testing with Swagger UI
-
-Start the API and open **http://localhost:8001/docs** (or your configured port) for interactive Swagger UI documentation. The synchronous endpoint `POST /api/v1/products/analyze-equivalents` is the primary testing entrypoint:
-
-```json
-{
-  "name": "ABB S201-C16",
-  "description": "Disjoncteur modulaire MCB 1P 16A courbe C 6kA",
-  "sku": "S201-C16",
-  "product_type": "mcb_1p_c_16a",
-  "brand": "ABB",
-  "voltage_v": 230,
-  "current_a": 16,
-  "poles": 1,
-  "curve": "C",
-  "breaking_capacity_ka": 6.0,
-  "phase": "single",
-  "mounting": "din_rail",
-  "standard": "IEC 60898",
-  "usage": "residential",
-  "target_price": 8.50,
-  "currency": "EUR"
-}
-```
-
-> **Note:** Mock mode returns results instantly (~2s). Real mode requires valid API keys and may take 30–60s depending on rate limits.
+Set `MOCK_MODE=true` to run the full pipeline without any API keys. Returns 5 mock SerpApi results (Schneider €8.50, Legrand €7.80, Hager €9.20, Siemens €12.50, ABB €7.95) with mock LLM summary. Latency: ~39ms.
 
 ## Test coverage
 
-47 unit tests covering:
-- Electrical domain detection (12 tests)
-- Deterministic pre-scoring with electrical products (15 tests)
-- Category similarity for electrical categories
-- Cross-brand bonus with electrical brands
-- Accessory detection for electrical accessories (bobine, bornier, plaque, etc.)
-- Electrical keywords/brands list validation
-- Fixtures (7 real electrical products: ABB, Schneider, Legrand, Hager, Siemens, EV charger, cable)
+106 unit tests covering:
+- Domain detection (electrical vs non-electrical)
+- Spec inference (current_a, poles, curve, kA, voltage, mounting, sensitivity_ma, differential_type, brand)
+- RCD-specific extraction (30mA, type AC/A/F, 2P from "2x40A")
+- Spec quality scoring with all weights and penalties
+- Differential type matching penalty (-0.20 for mismatch)
+- Brand diversification (max 2/brand, min 3 brands)
+- Cross-brand bonus, same-brand detection
+- Vague title detection
+- Merchant trust scoring
+- Output capping (max 5, max 2 per brand)
