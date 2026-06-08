@@ -107,6 +107,8 @@ MOCK_MODE=true uvicorn api.main:app --reload --port 8001
 | `DELETE` | `/api/v1/products/{id}` | Delete product |
 | **`POST`** | **`/api/v1/products/analyze-equivalents`** | **Main endpoint — synchronous analysis** |
 | `POST` | `/api/v1/products/{id}/analyze` | Trigger Celery async analysis (legacy) |
+| `GET` | `/api/v1/products/{id}/analysis/latest` | Dernière analyse complétée d'un produit |
+| `GET` | `/api/v1/products/{id}/analysis/{run_id}` | Analyse spécifique par son run_id |
 | `GET` | `/api/v1/products/{id}/offers` | Competitor offers |
 | `GET` | `/api/v1/products/{id}/price-history` | Price snapshots |
 | `GET` | `/api/v1/dashboard/summary` | Dashboard aggregation |

@@ -214,6 +214,88 @@ async def analyze_product(product_id: str, db: AsyncSession = Depends(get_db)):
                            message="Analysis started")
 
 
+@app.get("/api/v1/products/{product_id}/analysis/latest")
+async def get_latest_analysis(product_id: str, db: AsyncSession = Depends(get_db)):
+    product = await db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "Product not found")
+    run = await db.execute(
+        select(AnalysisRun)
+        .where(AnalysisRun.product_id == product_id,
+               AnalysisRun.status == AnalysisStatus.completed)
+        .order_by(AnalysisRun.created_at.desc())
+        .limit(1)
+    )
+    run = run.scalar_one_or_none()
+    if not run:
+        raise HTTPException(404, "No completed analysis found for this product")
+    offers = await db.execute(
+        select(Offer).where(Offer.product_id == product_id).order_by(Offer.price)
+    )
+    offers = offers.scalars().all()
+    return {
+        "run_id": str(run.id),
+        "status": run.status,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+        "total_latency_ms": run.total_latency_ms,
+        "candidate_count": run.candidate_count,
+        "valid_match_count": run.valid_match_count,
+        "best_match_price": run.best_match_price,
+        "best_match_score": run.best_match_score,
+        "price_confidence": run.price_confidence,
+        "recommendation": (run.final_decision or {}).get("summary") if run.final_decision else None,
+        "offers": [
+            {
+                "title": o.title,
+                "price": o.price,
+                "currency": o.currency,
+                "merchant": o.merchant,
+                "url": o.url,
+            }
+            for o in offers
+        ],
+    }
+
+
+@app.get("/api/v1/products/{product_id}/analysis/{run_id}")
+async def get_analysis_run(product_id: str, run_id: str, db: AsyncSession = Depends(get_db)):
+    product = await db.get(Product, product_id)
+    if not product:
+        raise HTTPException(404, "Product not found")
+    run = await db.get(AnalysisRun, run_id)
+    if not run or str(run.product_id) != product_id:
+        raise HTTPException(404, "Analysis run not found")
+    offers = await db.execute(
+        select(Offer).where(Offer.product_id == product_id).order_by(Offer.price)
+    )
+    offers = offers.scalars().all()
+    return {
+        "run_id": str(run.id),
+        "status": run.status,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+        "total_latency_ms": run.total_latency_ms,
+        "candidate_count": run.candidate_count,
+        "valid_match_count": run.valid_match_count,
+        "best_match_price": run.best_match_price,
+        "best_match_score": run.best_match_score,
+        "price_confidence": run.price_confidence,
+        "error_message": run.error_message,
+        "recommendation": (run.final_decision or {}).get("summary") if run.final_decision else None,
+        "offers": [
+            {
+                "title": o.title,
+                "price": o.price,
+                "currency": o.currency,
+                "merchant": o.merchant,
+                "url": o.url,
+            }
+            for o in offers
+        ],
+    }
+
+
 @app.post("/api/v1/products/analyze-equivalents")
 async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depends(get_db)):
     from worker.tasks import (
