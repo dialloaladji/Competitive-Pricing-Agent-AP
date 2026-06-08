@@ -22,7 +22,7 @@ from api.config import settings
 from api.database import get_db, async_session_factory, engine, Base
 from api.models import Product, Offer, PriceSnapshot, AnalysisRun, AgentLog, AnalysisStatus
 from api.schemas import (
-    ProductCreate, ProductUpdate, ProductOut, OfferOut,
+    ProductUpdate, ProductOut, OfferOut,
     AnalysisRunOut, PriceSnapshotOut, MetricsSummary,
     AnalyzeResponse, DashboardSummary,
     EquivalentRequest, EquivalentOut, AnalyzeEquivalentsResponse,
@@ -171,15 +171,6 @@ async def get_product(product_id: str, db: AsyncSession = Depends(get_db)):
     product = await db.get(Product, product_id)
     if not product:
         raise HTTPException(404, "Product not found")
-    return ProductOut.model_validate(product)
-
-
-@app.post("/api/v1/products", status_code=201)
-async def create_product(data: ProductCreate, db: AsyncSession = Depends(get_db)):
-    product = Product(**data.model_dump())
-    db.add(product)
-    await db.commit()
-    await db.refresh(product)
     return ProductOut.model_validate(product)
 
 

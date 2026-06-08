@@ -3,18 +3,6 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 
-class ProductCreate(BaseModel):
-    name: str
-    description: str = ""
-    category: str | None = None
-    brand: str | None = None
-    sku: str | None = None
-    image_url: str | None = None
-    target_price: float | None = None
-    currency: str = "EUR"
-    is_tracked: bool = True
-
-
 class ProductUpdate(BaseModel):
     name: str | None = None
     description: str | None = None

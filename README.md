@@ -102,7 +102,6 @@ MOCK_MODE=true uvicorn api.main:app --reload --port 8001
 | `GET` | `/health` | Service health check |
 | `GET` | `/metrics-summary` | Aggregated metrics |
 | `GET` | `/api/v1/products` | List products |
-| `POST` | `/api/v1/products` | Create product |
 | `GET` | `/api/v1/products/{id}` | Get product |
 | `PUT` | `/api/v1/products/{id}` | Update product |
 | `DELETE` | `/api/v1/products/{id}` | Delete product |
