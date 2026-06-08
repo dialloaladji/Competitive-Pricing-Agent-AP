@@ -258,14 +258,12 @@ async def get_latest_analysis(product_id: str, db: AsyncSession = Depends(get_db
     }
 
 
-@app.get("/api/v1/products/{product_id}/analysis/{run_id}")
-async def get_analysis_run(product_id: str, run_id: str, db: AsyncSession = Depends(get_db)):
-    product = await db.get(Product, product_id)
-    if not product:
-        raise HTTPException(404, "Product not found")
+@app.get("/api/v1/analysis/{run_id}")
+async def get_analysis_run(run_id: str, db: AsyncSession = Depends(get_db)):
     run = await db.get(AnalysisRun, run_id)
-    if not run or str(run.product_id) != product_id:
+    if not run:
         raise HTTPException(404, "Analysis run not found")
+    product_id = str(run.product_id)
     offers = await db.execute(
         select(Offer).where(Offer.product_id == product_id).order_by(Offer.price)
     )
