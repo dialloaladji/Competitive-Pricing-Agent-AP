@@ -85,6 +85,35 @@ class GroqClient:
             "model": self.model,
         }
 
+    async def chat_messages(self, messages: list[dict], max_tokens: int | None = None) -> dict[str, Any]:
+        start = time.time()
+        response = await self.client.post(
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            json={
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens or settings.llm_max_tokens,
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+            },
+        )
+        if response.status_code == 429:
+            retry_after = int(response.headers.get("Retry-After", 10))
+            await asyncio.sleep(retry_after)
+        response.raise_for_status()
+        data = response.json()
+        latency = (time.time() - start) * 1000
+        choice = data["choices"][0]
+        usage = data.get("usage", {})
+        return {
+            "content": choice["message"]["content"],
+            "latency_ms": latency,
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+            "model": self.model,
+        }
+
     async def close(self):
         await self.client.aclose()
 
@@ -106,6 +135,9 @@ class MockClient:
             "output_tokens": 50,
             "model": "mock",
         }
+
+    async def chat_messages(self, messages: list[dict], max_tokens: int | None = None) -> dict[str, Any]:
+        return await self.chat("", "")
 
     async def close(self):
         pass

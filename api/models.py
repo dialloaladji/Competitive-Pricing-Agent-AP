@@ -124,3 +124,42 @@ class AgentLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     analysis_run = relationship("AnalysisRun", back_populates="agent_logs")
+
+
+class ChatConversation(Base):
+    __tablename__ = "chat_conversations"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    user_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    messages = relationship("ChatMessage", back_populates="conversation", cascade="all, delete-orphan")
+    summaries = relationship("ChatMemorySummary", back_populates="conversation", cascade="all, delete-orphan")
+
+
+class ChatMessage(Base):
+    __tablename__ = "chat_messages"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("chat_conversations.id"), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    msg_metadata: Mapped[dict | None] = mapped_column("metadata", JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    conversation = relationship("ChatConversation", back_populates="messages")
+
+
+class ChatMemorySummary(Base):
+    __tablename__ = "chat_memory_summaries"
+
+    id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("chat_conversations.id"), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    covered_until_message_id: Mapped[str | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    conversation = relationship("ChatConversation", back_populates="summaries")

@@ -7,10 +7,14 @@ from datetime import datetime
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from api.chat_memory import (
+    get_or_create_conversation, save_message, load_recent_messages,
+    load_conversation_summary, build_chat_context, maybe_update_conversation_summary,
+)
 from api.chat_schemas import (
     ChatResponse, ProductBrief, PriceAnalysis, MarketAnalysis,
 )
-from api.models import Product, Offer, PriceSnapshot, AnalysisRun, AnalysisStatus
+from api.models import Product, Offer, PriceSnapshot, AnalysisRun, AnalysisStatus, ChatConversation, ChatMessage
 from api.llm_client import get_llm_client, search_serpapi
 from worker.tasks import normalize_candidates, score_candidates
 from worker.scoring import (
@@ -46,6 +50,14 @@ ANTI-HALLUCINATION RULES (YOU MUST FOLLOW):
 - If information is missing, state it clearly.
 - Always separate: observed facts, hypotheses, and recommendations.
 
+CONVERSATION MEMORY RULES:
+- Conversation history contains user statements and previous assistant guesses.
+- Do NOT treat them as verified facts.
+- Verified facts come ONLY from the "Verified database context" section.
+- Prices, stock, references must come from database context, not from memory.
+- If a fact is only in conversation memory, say "according to our conversation" or "you mentioned".
+- If uncertain, state clearly that the information is not verified.
+
 Output JSON with these keys:
 - answer: str — natural language expert answer (3-8 sentences)
 - observed_facts: list[str]
@@ -66,6 +78,13 @@ ANTI-HALLUCINATION RULES (YOU MUST FOLLOW):
 - If no equivalents were found, say so clearly.
 - If confidence is low, explain why.
 - Suggest what additional information would improve the search.
+
+CONVERSATION MEMORY RULES:
+- Conversation history contains user statements and previous assistant guesses.
+- Do NOT treat them as verified facts.
+- Verified facts come ONLY from the "Verified database context" section.
+- Prices, stock, references must come from database context, not from memory.
+- If uncertain, state clearly that the information is not verified.
 
 Output JSON with these keys:
 - answer: str — natural language analysis (3-8 sentences)
@@ -120,10 +139,23 @@ class ChatOrchestrator:
         message: str,
         product_id: str | None = None,
         conversation_id: str | None = None,
+        user_id: str | None = None,
     ) -> ChatResponse:
         start_time = time.time()
         actions: list[str] = []
         sources: list[str] = []
+
+        conv, conv_action = await get_or_create_conversation(self.db, conversation_id, user_id, message)
+        conversation_id = str(conv.id)
+        self._current_conversation_id = conversation_id
+        await save_message(self.db, conversation_id, "user", message)
+        actions.append(f"conversation_{conv_action}")
+        actions.append("user_message_saved")
+
+        summary = await load_conversation_summary(self.db, conversation_id)
+        recent = await load_recent_messages(self.db, conversation_id)
+        self._conversation_summary = summary.summary if summary else None
+        self._recent_messages = recent[:-1] if recent else []
 
         intent, intent_conf = await self._classify_intent(message)
         sources.append("intent_classifier")
@@ -160,6 +192,10 @@ class ChatOrchestrator:
                 reference=product.sku,
             )
 
+        assistant_msg = await save_message(self.db, conversation_id, "assistant", resp.answer)
+        await maybe_update_conversation_summary(self.db, conversation_id, self.llm)
+        resp.conversation_id = conversation_id
+        resp.message_id = str(assistant_msg.id)
         resp.intent = intent
         latency_ms = int((time.time() - start_time) * 1000)
         logger.info(
@@ -298,28 +334,44 @@ class ChatOrchestrator:
         price_analysis = self._compute_price_analysis(product, price_history)
         if self.is_mock:
             return self._mock_answer(product, offers, price_analysis, intent)
-        product_info = (
-            f"Product: {product.name} | Brand: {product.brand or 'N/A'} | "
-            f"Category: {product.category or 'N/A'} | SKU: {product.sku or 'N/A'}\n"
-            f"Specs: current_a={product.current_a}, poles={product.poles}, "
-            f"curve={product.curve}, kA={product.breaking_capacity_ka}\n"
+        product_context = {
+            "product": product.name,
+            "brand": product.brand,
+            "category": product.category,
+            "sku": product.sku,
+            "specs": {
+                "current_a": product.current_a,
+                "poles": product.poles,
+                "curve": product.curve,
+                "breaking_capacity_ka": product.breaking_capacity_ka,
+            },
+            "offers_count": len(offers),
+            "offers": [
+                {"price": o["price"], "merchant": o.get("merchant"), "in_stock": o.get("in_stock")}
+                for o in offers[:10]
+            ],
+            "price_history": {
+                "has_data": price_analysis.has_history,
+                "min_price": price_analysis.min_price,
+                "max_price": price_analysis.max_price,
+                "median_price": price_analysis.median_price,
+                "trend": price_analysis.trend,
+            },
+            "intent": intent,
+        }
+        current_msg = (
+            f"Intent: {intent}\n"
+            f"Provide a detailed analysis for product: {product.name}."
         )
-        offers_info = f"Offers ({len(offers)} found):\n"
-        for o in offers[:10]:
-            offers_info += f"  - €{o['price']} at {o.get('merchant', 'N/A')} (stock: {o.get('in_stock', 'N/A')})\n"
-        history_info = f"Price history:\n  Has data: {price_analysis.has_history}\n"
-        if price_analysis.has_history:
-            history_info += (
-                f"  Min: €{price_analysis.min_price}\n"
-                f"  Max: €{price_analysis.max_price}\n"
-                f"  Median: €{price_analysis.median_price}\n"
-                f"  Trend: {price_analysis.trend}\n"
-            )
-        else:
-            history_info += "  No historical price data available.\n"
-        user = f"{product_info}\n{offers_info}\n{history_info}\nIntent: {intent}"
+        context_messages = build_chat_context(
+            SYSTEM_ANSWER_PROMPT,
+            getattr(self, "_conversation_summary", None),
+            getattr(self, "_recent_messages", []),
+            product_context,
+            current_msg,
+        )
         try:
-            resp = await self.llm.chat(SYSTEM_ANSWER_PROMPT, user)
+            resp = await self.llm.chat_messages(context_messages)
             return json.loads(resp["content"])
         except Exception:
             return {
@@ -558,9 +610,26 @@ class ChatOrchestrator:
                 )
         else:
             results_info += "No scored results available.\n"
-        user = f"{product_info}\n{results_info}"
+        current_msg = f"{product_info}\n{results_info}"
+        product_context = {
+            "detected_category": inferred.get("category", "unknown"),
+            "detected_brand": inferred.get("brand"),
+            "detected_specs": inferred.get("specs", {}),
+            "results_found": n,
+            "scored_results": [
+                {"title": s.get("title", "")[:80], "price": s.get("price"), "score": s.get("score")}
+                for s in top[:5]
+            ] if top else [],
+        }
+        context_messages = build_chat_context(
+            SYSTEM_ANALYSIS_ANSWER_PROMPT,
+            getattr(self, "_conversation_summary", None),
+            getattr(self, "_recent_messages", []),
+            product_context,
+            current_msg,
+        )
         try:
-            resp = await self.llm.chat(SYSTEM_ANALYSIS_ANSWER_PROMPT, user)
+            resp = await self.llm.chat_messages(context_messages)
             data = json.loads(resp["content"])
             data["sources_used"] = sources
             return data

@@ -5,6 +5,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, max_length=2000)
     product_id: str | None = None
     conversation_id: str | None = None
+    user_id: str | None = None
 
 
 class ProductBrief(BaseModel):
@@ -45,3 +46,5 @@ class ChatResponse(BaseModel):
     sources_used: list[str] = []
     actions_triggered: list[str] = []
     missing_information: list[str] = []
+    conversation_id: str | None = None
+    message_id: str | None = None
