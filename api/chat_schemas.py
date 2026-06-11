@@ -48,3 +48,4 @@ class ChatResponse(BaseModel):
     missing_information: list[str] = []
     conversation_id: str | None = None
     message_id: str | None = None
+    product_id: str | None = None

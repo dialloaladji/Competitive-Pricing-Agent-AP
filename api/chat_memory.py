@@ -57,11 +57,61 @@ async def load_recent_messages(
     stmt = (
         select(ChatMessage)
         .where(ChatMessage.conversation_id == conversation_id)
-        .order_by(ChatMessage.created_at.asc())
+        .order_by(ChatMessage.created_at.desc())
         .limit(limit)
     )
     result = await db.execute(stmt)
-    return list(result.scalars())
+    msgs = list(result.scalars())
+    msgs.reverse()
+    return msgs
+
+
+async def get_conversation_context(
+    db: AsyncSession,
+    conversation_id: str,
+) -> dict:
+    recent = await load_recent_messages(db, conversation_id, limit=10)
+    summary = await load_conversation_summary(db, conversation_id)
+
+    stmt = (
+        select(ChatMessage)
+        .where(ChatMessage.conversation_id == conversation_id)
+        .where(ChatMessage.role == "assistant")
+        .order_by(ChatMessage.created_at.desc())
+        .limit(10)
+    )
+    result = await db.execute(stmt)
+    assistant_msgs = list(result.scalars())
+
+    product_id = None
+    product_name = None
+    offers: list = []
+    equivalents: list = []
+    price_analysis = None
+
+    for msg in assistant_msgs:
+        meta = msg.msg_metadata or {}
+        if product_id is None and meta.get("product_id"):
+            product_id = meta["product_id"]
+            product_name = meta.get("product_name")
+        if not offers and meta.get("offers"):
+            offers = meta["offers"]
+        if not equivalents and meta.get("equivalents"):
+            equivalents = meta["equivalents"]
+        if price_analysis is None and meta.get("price_analysis"):
+            price_analysis = meta["price_analysis"]
+        if product_id and offers and equivalents:
+            break
+
+    return {
+        "summary": summary.summary if summary else None,
+        "recent_messages": recent,
+        "product_id": product_id,
+        "product_name": product_name,
+        "offers": offers,
+        "equivalents": equivalents,
+        "price_analysis": price_analysis,
+    }
 
 
 async def load_conversation_summary(

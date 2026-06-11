@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from api.chat_memory import (
     get_or_create_conversation, save_message, load_recent_messages,
     load_conversation_summary, build_chat_context, maybe_update_conversation_summary,
+    get_conversation_context,
 )
 from api.chat_schemas import (
     ChatResponse, ProductBrief, PriceAnalysis, MarketAnalysis,
@@ -23,6 +24,18 @@ from worker.scoring import (
 )
 
 logger = logging.getLogger("api.chat")
+
+# Intents that warrant fetching equivalent analysis results
+ANALYSIS_INTENTS = {
+    "equivalent_products_search",
+    "product_comparison",
+    "price_analysis",
+    "price_history_analysis",
+    "market_analysis",
+}
+
+# Minimum score threshold for classifying an offer as an exact source-product match
+EXACT_MATCH_SCORE_THRESHOLD = 0.88
 
 SYSTEM_INTENT_PROMPT = """Classify the user's question about electrical products into exactly one intent.
 
@@ -49,6 +62,13 @@ ANTI-HALLUCINATION RULES (YOU MUST FOLLOW):
 - Do NOT present hypotheses as facts.
 - If information is missing, state it clearly.
 - Always separate: observed facts, hypotheses, and recommendations.
+
+OFFER VALIDATION RULES (YOU MUST FOLLOW):
+- Do NOT say "Product X is available at price Y" unless the offer is a confirmed exact match for Product X (same brand AND score >= 0.88).
+- If the offer belongs to another brand or is an equivalent product, say: "This appears to be an equivalent/candidate, not a confirmed exact listing for the source product."
+- When equivalent_analysis data is present, ALWAYS summarize: candidate count, valid match count, best match score, best price among strong equivalents, top cross-brand equivalents, and confidence level.
+- Weak candidates (low spec_quality or vague) must NOT be presented as confirmed products.
+- If best_match_score < 0.88, state clearly that confidence is limited and the result may not be an exact match.
 
 CONVERSATION MEMORY RULES:
 - Conversation history contains user statements and previous assistant guesses.
@@ -78,6 +98,12 @@ ANTI-HALLUCINATION RULES (YOU MUST FOLLOW):
 - If no equivalents were found, say so clearly.
 - If confidence is low, explain why.
 - Suggest what additional information would improve the search.
+
+OFFER VALIDATION RULES (YOU MUST FOLLOW):
+- Do NOT present any candidate as a confirmed exact listing for the source product unless score >= 0.88 and same brand.
+- If best_match_score < 0.88, state that confidence is limited.
+- Weak candidates (is_vague=true or spec_quality < 0.25) must be excluded from recommendations.
+- Always state the number of candidates, valid matches, and best match score.
 
 CONVERSATION MEMORY RULES:
 - Conversation history contains user statements and previous assistant guesses.
@@ -111,9 +137,10 @@ def _mock_intent(message: str) -> dict:
     message_lower = message.lower()
     if any(w in message_lower for w in ["historique", "price history", "price evolution", "evolution", "price trend", "trend"]):
         return {"intent": "price_history_analysis", "confidence": 0.7}
-    if any(w in message_lower for w in ["compare", "comparer", "vs", "versus"]):
+    if any(w in message_lower for w in ["compare", "comparer", "comparaison", "comparison", "vs", "versus"]):
         return {"intent": "product_comparison", "confidence": 0.7}
-    if any(w in message_lower for w in ["equivalent", "alternative", "remplacer", "similar"]):
+    if any(w in message_lower for w in ["equivalent", "équivalent", "equivalents", "équivalents",
+                                          "alternative", "remplacer", "similar", "trouve"]):
         return {"intent": "equivalent_products_search", "confidence": 0.7}
     if any(w in message_lower for w in ["stock", "disponible", "available", "rupture"]):
         return {"intent": "stock_analysis", "confidence": 0.7}
@@ -152,10 +179,16 @@ class ChatOrchestrator:
         actions.append(f"conversation_{conv_action}")
         actions.append("user_message_saved")
 
-        summary = await load_conversation_summary(self.db, conversation_id)
-        recent = await load_recent_messages(self.db, conversation_id)
-        self._conversation_summary = summary.summary if summary else None
+        conv_context = await get_conversation_context(self.db, conversation_id)
+        self._conversation_summary = conv_context["summary"]
+        recent = conv_context["recent_messages"]
         self._recent_messages = recent[:-1] if recent else []
+        self._conversation_context = conv_context
+
+        # Reuse product_id from previous messages when not supplied in a follow-up
+        if not product_id and conv_action == "existing" and conv_context.get("product_id"):
+            product_id = conv_context["product_id"]
+            actions.append("product_id_reused_from_conversation")
 
         intent, intent_conf = await self._classify_intent(message)
         sources.append("intent_classifier")
@@ -191,8 +224,20 @@ class ChatOrchestrator:
                 category=product.category,
                 reference=product.sku,
             )
+            resp.product_id = str(product.id)
 
-        assistant_msg = await save_message(self.db, conversation_id, "assistant", resp.answer)
+        assistant_metadata = {
+            "product_id": str(product.id) if product else None,
+            "product_name": product.name if product else None,
+            "offers": resp.offers[:10] if resp.offers else [],
+            "equivalents": resp.equivalents[:10] if resp.equivalents else [],
+            "price_analysis": resp.price_analysis.model_dump() if resp.price_analysis else None,
+            "sources_used": resp.sources_used,
+            "actions_triggered": actions,
+        }
+        assistant_msg = await save_message(
+            self.db, conversation_id, "assistant", resp.answer, metadata=assistant_metadata
+        )
         await maybe_update_conversation_summary(self.db, conversation_id, self.llm)
         resp.conversation_id = conversation_id
         resp.message_id = str(assistant_msg.id)
@@ -260,19 +305,45 @@ class ChatOrchestrator:
         return candidates
 
     async def _get_offers(self, product_id: str) -> list[dict]:
+        """Return only confirmed exact offers for the source product.
+
+        An offer qualifies as an exact source-product offer when:
+        - raw_data is absent (legacy offer, returned as-is for backward compat), OR
+        - same brand AND score >= EXACT_MATCH_SCORE_THRESHOLD, OR
+        - classification == "exact_match" AND score >= EXACT_MATCH_SCORE_THRESHOLD
+        """
         stmt = select(Offer).where(Offer.product_id == product_id).order_by(Offer.price)
         result = await self.db.execute(stmt)
-        return [
-            {
-                "title": o.title,
-                "price": o.price,
-                "currency": o.currency,
-                "merchant": o.merchant,
-                "url": o.url,
-                "in_stock": o.in_stock,
-            }
-            for o in result.scalars()
-        ]
+        exact_offers = []
+        for o in result.scalars():
+            raw = o.raw_data or {}
+            if not raw:
+                # Legacy offer without scoring data — include as-is
+                exact_offers.append({
+                    "title": o.title,
+                    "price": o.price,
+                    "currency": o.currency,
+                    "merchant": o.merchant,
+                    "url": o.url,
+                    "in_stock": o.in_stock,
+                })
+                continue
+            score = raw.get("score", 0)
+            is_same_brand = raw.get("is_same_brand", False)
+            classification = raw.get("classification", "")
+            if (
+                (is_same_brand and score >= EXACT_MATCH_SCORE_THRESHOLD)
+                or (classification == "exact_match" and score >= EXACT_MATCH_SCORE_THRESHOLD)
+            ):
+                exact_offers.append({
+                    "title": o.title,
+                    "price": o.price,
+                    "currency": o.currency,
+                    "merchant": o.merchant,
+                    "url": o.url,
+                    "in_stock": o.in_stock,
+                })
+        return exact_offers
 
     async def _get_price_history(self, product_id: str) -> list[dict]:
         stmt = (
@@ -291,9 +362,75 @@ class ChatOrchestrator:
             for s in result.scalars()
         ]
 
-    async def _get_equivalents(self, product_id: str) -> list[dict]:
-        offers = await self._get_offers(product_id)
-        return offers
+    async def _get_latest_equivalent_analysis(self, product_id: str) -> dict | None:
+        """Retrieve the latest completed equivalent analysis for a product.
+
+        Returns a dict with:
+        - run_id, candidate_count, valid_match_count, best_match_score, price_confidence,
+          recommendation, cross_brand_equivalents, partial_spec_equivalents, weak_candidates
+        Returns None if no completed analysis run exists.
+        """
+        stmt = (
+            select(AnalysisRun)
+            .where(AnalysisRun.product_id == product_id)
+            .where(AnalysisRun.status == AnalysisStatus.completed)
+            .order_by(AnalysisRun.created_at.desc())
+            .limit(1)
+        )
+        result = await self.db.execute(stmt)
+        run = result.scalar_one_or_none()
+        if not run:
+            return None
+
+        stmt = (
+            select(Offer)
+            .where(Offer.product_id == product_id)
+            .where(Offer.source == "analysis")
+            .order_by(Offer.price)
+        )
+        result = await self.db.execute(stmt)
+        offers = list(result.scalars())
+
+        cross_brand: list[dict] = []
+        partial: list[dict] = []
+        weak: list[dict] = []
+
+        for o in offers:
+            raw = o.raw_data or {}
+            quality_bucket = raw.get("quality_bucket", "")
+            is_same_brand = raw.get("is_same_brand", False)
+            entry = {
+                "title": o.title,
+                "price": o.price,
+                "currency": o.currency,
+                "merchant": o.merchant,
+                "url": o.url,
+                "score": raw.get("score", 0),
+                "spec_quality": raw.get("spec_quality", 0),
+                "classification": raw.get("classification", "functional_equivalent"),
+                "spec_match": raw.get("spec_match", "functional_equivalent"),
+                "is_vague": raw.get("is_vague", False),
+                "brand": raw.get("brand"),
+                "is_same_brand": is_same_brand,
+            }
+            if quality_bucket == "reliable" and not is_same_brand:
+                cross_brand.append(entry)
+            elif quality_bucket == "partial":
+                partial.append(entry)
+            else:
+                weak.append(entry)
+
+        return {
+            "run_id": str(run.id),
+            "candidate_count": run.candidate_count or 0,
+            "valid_match_count": run.valid_match_count or 0,
+            "cross_brand_equivalents": cross_brand,
+            "partial_spec_equivalents": partial,
+            "weak_candidates": weak,
+            "best_match_score": run.best_match_score,
+            "price_confidence": run.price_confidence,
+            "recommendation": (run.final_decision or {}).get("summary"),
+        }
 
     def _compute_price_analysis(self, product: Product, price_history: list[dict]) -> PriceAnalysis:
         if not price_history:
@@ -330,10 +467,11 @@ class ChatOrchestrator:
         offers: list[dict],
         price_history: list[dict],
         intent: str,
+        eq_analysis: dict | None = None,
     ) -> dict:
         price_analysis = self._compute_price_analysis(product, price_history)
         if self.is_mock:
-            return self._mock_answer(product, offers, price_analysis, intent)
+            return self._mock_answer(product, offers, price_analysis, intent, eq_analysis)
         product_context = {
             "product": product.name,
             "brand": product.brand,
@@ -345,8 +483,8 @@ class ChatOrchestrator:
                 "curve": product.curve,
                 "breaking_capacity_ka": product.breaking_capacity_ka,
             },
-            "offers_count": len(offers),
-            "offers": [
+            "exact_offers_count": len(offers),
+            "exact_offers": [
                 {"price": o["price"], "merchant": o.get("merchant"), "in_stock": o.get("in_stock")}
                 for o in offers[:10]
             ],
@@ -359,6 +497,39 @@ class ChatOrchestrator:
             },
             "intent": intent,
         }
+        if eq_analysis:
+            cross_brand = eq_analysis.get("cross_brand_equivalents", [])
+            best_match_score = eq_analysis.get("best_match_score")
+            product_context["equivalent_analysis"] = {
+                "candidate_count": eq_analysis.get("candidate_count", 0),
+                "valid_match_count": eq_analysis.get("valid_match_count", 0),
+                "best_match_score": best_match_score,
+                "price_confidence": eq_analysis.get("price_confidence"),
+                "cross_brand_count": len(cross_brand),
+                "partial_spec_count": len(eq_analysis.get("partial_spec_equivalents", [])),
+                "weak_candidate_count": len(eq_analysis.get("weak_candidates", [])),
+                "top_cross_brand": [
+                    {
+                        "title": e["title"][:60],
+                        "price": e["price"],
+                        "brand": e.get("brand"),
+                        "score": e["score"],
+                        "is_confirmed_exact": (
+                            e.get("is_same_brand", False) and e["score"] >= EXACT_MATCH_SCORE_THRESHOLD
+                        ),
+                    }
+                    for e in cross_brand[:3]
+                ],
+                "recommendation": eq_analysis.get("recommendation"),
+                "confidence_limited": best_match_score is not None and best_match_score < EXACT_MATCH_SCORE_THRESHOLD,
+            }
+
+        conv_ctx = getattr(self, "_conversation_context", {})
+        if not offers and conv_ctx.get("offers"):
+            product_context["previous_offers_from_conversation"] = conv_ctx["offers"]
+        if not (eq_analysis and eq_analysis.get("cross_brand_equivalents")) and conv_ctx.get("equivalents"):
+            product_context["previous_equivalents_from_conversation"] = conv_ctx["equivalents"][:10]
+
         current_msg = (
             f"Intent: {intent}\n"
             f"Provide a detailed analysis for product: {product.name}."
@@ -375,11 +546,11 @@ class ChatOrchestrator:
             return json.loads(resp["content"])
         except Exception:
             return {
-                "answer": f"The product {product.name} was found with {len(offers)} offer(s). "
+                "answer": f"The product {product.name} was found with {len(offers)} confirmed offer(s). "
                           f"Price range: €{min((o['price'] for o in offers), default=0):.2f} - "
                           f"€{max((o['price'] for o in offers), default=0):.2f}. "
                           f"{'Price history is available (' + price_analysis.trend + ' trend).' if price_analysis.has_history else 'No price history available.'}",
-                "observed_facts": [f"Product found: {product.name}", f"{len(offers)} offers found"],
+                "observed_facts": [f"Product found: {product.name}", f"{len(offers)} exact offers found"],
                 "hypotheses": [],
                 "risks": [],
                 "recommendations": [
@@ -390,12 +561,19 @@ class ChatOrchestrator:
                 "sources_used": ["database"],
             }
 
-    def _mock_answer(self, product, offers, price_analysis, intent):
-        if not offers:
+    def _mock_answer(self, product, offers, price_analysis, intent, eq_analysis=None):
+        cross_brand = (eq_analysis or {}).get("cross_brand_equivalents", [])
+        partial = (eq_analysis or {}).get("partial_spec_equivalents", [])
+        best_match_score = (eq_analysis or {}).get("best_match_score")
+        candidate_count = (eq_analysis or {}).get("candidate_count", 0)
+        valid_match_count = (eq_analysis or {}).get("valid_match_count", 0)
+        confidence_limited = best_match_score is not None and best_match_score < EXACT_MATCH_SCORE_THRESHOLD
+
+        if not offers and not eq_analysis:
             return {
                 "answer": f"Product **{product.name}** ({product.brand or 'N/A'}) found in our database. "
-                          f"No current offers are tracked yet.",
-                "observed_facts": [f"Product {product.name} exists in database", "No offers found"],
+                          f"No confirmed exact offers are tracked yet.",
+                "observed_facts": [f"Product {product.name} exists in database", "No confirmed exact offers found"],
                 "hypotheses": [],
                 "risks": [],
                 "recommendations": [
@@ -406,37 +584,84 @@ class ChatOrchestrator:
                 "missing_information": ["offers", "price_history"],
                 "sources_used": ["database"],
             }
-        min_price = min(o["price"] for o in offers)
-        max_price = max(o["price"] for o in offers)
-        cheapest = [o for o in offers if o["price"] == min_price][0]
-        price_trend = price_analysis.trend if price_analysis.has_history else "unknown"
-        answer = (
-            f"**{product.name}** ({product.brand or 'N/A'}) — {len(offers)} offre(s) trouvée(s).\n\n"
-            f"Prix : de **€{min_price:.2f}** à **€{max_price:.2f}**.\n"
-            f"Meilleur prix : **€{min_price:.2f}** chez **{cheapest.get('merchant', 'inconnu')}**.\n"
-        )
-        if price_analysis.has_history:
-            answer += f"Historique de prix disponible. Tendances : {price_trend}.\n"
+
+        answer_parts = [f"**{product.name}** ({product.brand or 'N/A'})"]
+
+        if offers:
+            min_price = min(o["price"] for o in offers)
+            max_price = max(o["price"] for o in offers)
+            cheapest = [o for o in offers if o["price"] == min_price][0]
+            answer_parts.append(
+                f" — {len(offers)} confirmed exact offer(s) found.\n"
+                f"Price: from **€{min_price:.2f}** to **€{max_price:.2f}**.\n"
+                f"Best price: **€{min_price:.2f}** at **{cheapest.get('merchant', 'unknown')}**.\n"
+            )
+            if price_analysis.has_history:
+                answer_parts.append(f"Price history available. Trend: {price_analysis.trend}.\n")
+            else:
+                answer_parts.append("No price history available.\n")
         else:
-            answer += "Aucun historique de prix disponible.\n"
+            answer_parts.append(" — No confirmed exact offers for this product.\n")
+
+        if eq_analysis:
+            answer_parts.append(
+                f"\n**Equivalent analysis**: {candidate_count} candidate(s) found, "
+                f"{valid_match_count} valid match(es).\n"
+            )
+            if cross_brand:
+                best_eq = cross_brand[0]
+                answer_parts.append(
+                    f"Best equivalent: **{best_eq['title'][:60]}** at **€{best_eq['price']:.2f}** "
+                    f"(score: {best_eq['score']:.2f}).\n"
+                )
+                if confidence_limited:
+                    answer_parts.append(
+                        f"**Note**: best match score is {best_match_score:.2f} — "
+                        f"confidence is limited; this may not be an exact equivalent.\n"
+                    )
+                if len(cross_brand) > 1:
+                    other_brands = ", ".join(
+                        f"{e.get('brand', 'Unknown')}" for e in cross_brand[1:3]
+                    )
+                    answer_parts.append(f"Other cross-brand options: {other_brands}.\n")
+            elif partial:
+                answer_parts.append(
+                    f"Only partial-spec equivalents found ({len(partial)}). "
+                    f"Confidence is limited.\n"
+                )
+            else:
+                answer_parts.append("No strong cross-brand equivalents found.\n")
+
+        answer = "".join(answer_parts)
+
+        observed_facts = [
+            f"Product: {product.name}",
+            f"Brand: {product.brand}",
+            f"Category: {product.category}",
+            f"Confirmed exact offers: {len(offers)}",
+        ]
+        if eq_analysis:
+            observed_facts += [
+                f"Equivalent candidates found: {candidate_count}",
+                f"Valid matches (reliable): {valid_match_count}",
+                f"Cross-brand equivalents: {len(cross_brand)}",
+            ]
+            if confidence_limited:
+                observed_facts.append(
+                    f"Best match score {best_match_score:.2f} is below 0.88 — limited confidence"
+                )
+
         return {
             "answer": answer,
-            "observed_facts": [
-                f"Product: {product.name}",
-                f"Brand: {product.brand}",
-                f"Category: {product.category}",
-                f"Offers found: {len(offers)}",
-                f"Price range: €{min_price:.2f} - €{max_price:.2f}",
-            ],
+            "observed_facts": observed_facts,
             "hypotheses": [],
             "risks": [],
             "recommendations": [
-                f"Consider {cheapest.get('merchant', 'the cheapest')} for best price",
-                "Add to watchlist for price alerts",
-            ],
-            "confidence": "high" if offers else "medium",
-            "missing_information": [] if price_analysis.has_history else ["price_history"],
-            "sources_used": ["database"],
+                "Verify specs match your needs before purchasing equivalent",
+            ] if cross_brand else ["Run a fresh equivalent analysis for updated results"],
+            "confidence": "low" if confidence_limited else ("high" if offers else "medium"),
+            "missing_information": [] if (offers or cross_brand) else ["exact_offers", "price_history"],
+            "sources_used": ["database", "equivalent_analysis"] if eq_analysis else ["database"],
         }
 
     async def _handle_product_found(
@@ -449,7 +674,28 @@ class ChatOrchestrator:
         actions.extend(["offers_retrieved"])
         if price_history:
             actions.append("price_history_retrieved")
-        answer_data = await self._generate_answer(product, offers, price_history, intent)
+
+        eq_analysis: dict | None = None
+        equivalents: list[dict] = []
+        if intent in ANALYSIS_INTENTS:
+            eq_analysis = await self._get_latest_equivalent_analysis(str(product.id))
+            if eq_analysis:
+                sources.append("equivalent_analysis")
+                actions.append("equivalent_analysis_retrieved")
+                equivalents = (
+                    eq_analysis.get("cross_brand_equivalents", [])
+                    + eq_analysis.get("partial_spec_equivalents", [])
+                )
+                logger.info(
+                    f"Equivalent analysis found | run_id={eq_analysis['run_id']} | "
+                    f"cross_brand={len(eq_analysis.get('cross_brand_equivalents', []))} | "
+                    f"partial={len(eq_analysis.get('partial_spec_equivalents', []))} | "
+                    f"weak={len(eq_analysis.get('weak_candidates', []))}"
+                )
+            else:
+                actions.append("no_equivalent_analysis_found")
+
+        answer_data = await self._generate_answer(product, offers, price_history, intent, eq_analysis)
         price_analysis = self._compute_price_analysis(product, price_history)
         missing = answer_data.get("missing_information", [])
         if not price_history and "price_history" not in missing:
@@ -458,6 +704,7 @@ class ChatOrchestrator:
             answer=answer_data.get("answer", "Analysis completed."),
             intent=intent,
             offers=offers,
+            equivalents=equivalents,
             price_analysis=price_analysis,
             market_analysis=MarketAnalysis(
                 observed_facts=answer_data.get("observed_facts", []),
@@ -491,10 +738,21 @@ class ChatOrchestrator:
             inferred = _infer_product_attributes(description=message)
         except Exception:
             inferred = {}
-        answer_data = await self._trigger_equivalent_analysis(message, inferred)
+        answer_data, scored_candidates = await self._trigger_equivalent_analysis(message, inferred)
+
+        products_found = [
+            ProductBrief(
+                name=s.get("title", "")[:100],
+                brand=s.get("brand"),
+            )
+            for s in scored_candidates[:5]
+            if s.get("title")
+        ]
+
         return ChatResponse(
             answer=answer_data.get("answer", "No equivalent products found."),
             intent=intent,
+            products_found=products_found,
             market_analysis=MarketAnalysis(
                 observed_facts=answer_data.get("observed_facts", []),
                 hypotheses=answer_data.get("hypotheses", []),
@@ -507,7 +765,8 @@ class ChatOrchestrator:
             missing_information=answer_data.get("missing_information", []),
         )
 
-    async def _trigger_equivalent_analysis(self, message: str, inferred: dict) -> dict:
+    async def _trigger_equivalent_analysis(self, message: str, inferred: dict) -> tuple[dict, list]:
+        """Run an inline equivalent analysis. Returns (answer_dict, scored_candidates)."""
         sources = ["serpapi"]
         try:
             results = await search_serpapi(message[:200])
@@ -523,7 +782,7 @@ class ChatOrchestrator:
                 "confidence": "low",
                 "missing_information": ["product_reference", "brand", "technical_specs"],
                 "sources_used": sources,
-            }
+            }, []
         if not results:
             return {
                 "answer": "No equivalent products found online. Consider adding more details.",
@@ -534,7 +793,7 @@ class ChatOrchestrator:
                 "confidence": "low",
                 "missing_information": ["brand", "reference", "technical_specs"],
                 "sources_used": sources,
-            }
+            }, []
         try:
             normalized = normalize_candidates(results)
             product_placeholder = type("Product", (), {
@@ -552,8 +811,9 @@ class ChatOrchestrator:
             logger.warning(f"Normalize/score failed in chat: {e}")
             scored = []
         if self.is_mock:
-            return self._mock_analysis_result(inferred, results, scored)
-        return await self._llm_analysis_result(inferred, results, scored, sources)
+            return self._mock_analysis_result(inferred, results, scored), scored
+        answer_data = await self._llm_analysis_result(inferred, results, scored, sources)
+        return answer_data, scored
 
     def _mock_analysis_result(self, inferred: dict, results: list, scored: list) -> dict:
         n = len(results)
@@ -621,6 +881,11 @@ class ChatOrchestrator:
                 for s in top[:5]
             ] if top else [],
         }
+        conv_ctx = getattr(self, "_conversation_context", {})
+        if not top and conv_ctx.get("equivalents"):
+            product_context["previous_equivalents_from_conversation"] = conv_ctx["equivalents"][:10]
+        if not top and conv_ctx.get("offers"):
+            product_context["previous_offers_from_conversation"] = conv_ctx["offers"]
         context_messages = build_chat_context(
             SYSTEM_ANALYSIS_ANSWER_PROMPT,
             getattr(self, "_conversation_summary", None),
