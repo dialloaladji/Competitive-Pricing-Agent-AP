@@ -105,6 +105,7 @@ MOCK_MODE=true uvicorn api.main:app --reload --port 8001
 | `GET` | `/api/v1/products/{id}` | Get product |
 | `PUT` | `/api/v1/products/{id}` | Update product |
 | `DELETE` | `/api/v1/products/{id}` | Delete product |
+| `POST` | `/api/v1/chat` | Chat conversationnel — posez des questions en langage naturel |
 | **`POST`** | **`/api/v1/products/analyze-equivalents`** | **Main endpoint — synchronous analysis** |
 | `POST` | `/api/v1/products/{id}/analyze` | Trigger Celery async analysis (legacy) |
 | `GET` | `/api/v1/products/{id}/analysis/latest` | Dernière analyse complétée d'un produit |
@@ -224,13 +225,64 @@ The API is **restricted to electrical products only**. Non-electrical descriptio
 | `LLM_PROVIDER` | — | `groq` | LLM backend |
 | `LLM_MAX_TOKENS` | — | `512` | Max LLM response tokens |
 
+## Chat API
+
+`POST /api/v1/chat` — posez des questions en langage naturel sur vos produits.
+
+### Request
+```json
+{
+  "message": "Compare this Schneider product with ABB and Legrand equivalents.",
+  "product_id": "uuid-optional",
+  "conversation_id": "uuid-optional"
+}
+```
+
+### Response structure
+```json
+{
+  "answer": "Expert analysis text...",
+  "intent": "product_comparison",
+  "product": { "id": "...", "name": "...", "brand": "...", "category": "..." },
+  "offers": [{"price": 8.50, "merchant": "Rexel", "in_stock": true}],
+  "price_analysis": {
+    "has_history": true,
+    "min_price": 7.80,
+    "max_price": 12.50,
+    "median_price": 8.50,
+    "trend": "stable"
+  },
+  "market_analysis": {
+    "observed_facts": ["3 offers found"],
+    "recommendations": ["Consider Rexel for best price"]
+  },
+  "confidence": "high",
+  "sources_used": ["database", "offers"],
+  "missing_information": ["price_history"]
+}
+```
+
+### Comportement
+- **Intent classification** automatique via LLM (ou `_mock_intent` en mock mode)
+- **Recherche base de données** d'abord avant tout appel externe
+- Si produit trouvé → réponse experte avec offres, historique, analyse
+- Si produit non trouvé → déclenchement automatique du pipeline `analyze-equivalents`
+- Anti-hallucination : ne jamais inventer de prix, stock, ou références
+
+### Exemples de questions supportées
+- "Compare this Schneider product with ABB equivalents."
+- "Show me the price evolution over the last 3 months."
+- "Which marketplace has the best price?"
+- "Find equivalent products for this reference."
+- "Do we have stock issues on this product?"
+
 ## Mock Mode
 
 Set `MOCK_MODE=true` to run the full pipeline without any API keys. Returns 5 mock SerpApi results (Schneider €8.50, Legrand €7.80, Hager €9.20, Siemens €12.50, ABB €7.95) with mock LLM summary. Latency: ~39ms.
 
 ## Test coverage
 
-106 unit tests covering:
+111 unit tests covering:
 - Domain detection (electrical vs non-electrical)
 - Spec inference (current_a, poles, curve, kA, voltage, mounting, sensitivity_ma, differential_type, brand)
 - RCD-specific extraction (30mA, type AC/A/F, 2P from "2x40A")
