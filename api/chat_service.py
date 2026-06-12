@@ -78,6 +78,16 @@ CONVERSATION MEMORY RULES:
 - If a fact is only in conversation memory, say "according to our conversation" or "you mentioned".
 - If uncertain, state clearly that the information is not verified.
 
+DEEP ANALYSIS RULES (apply when user asks to go deeper, list candidates, compare, or re-analyse):
+- NEVER repeat the same summary you already gave. If the user pushes for more, go further.
+- Enumerate ALL candidate buckets present in context: reliable, partial, weak.
+- For each candidate state: brand, title (truncated), price, score, and why confidence is limited.
+- Compare prices and brands across buckets to give a real market picture.
+- Explain WHY a score is low: vague specs, wrong brand, missing technical data, etc.
+- Give an opinionated recommendation even under uncertainty — just be explicit about confidence.
+- Never refuse to discuss weak/partial candidates — label them clearly and let the user decide.
+- If the user asks "which one is best", pick one and justify it, even if confidence is limited.
+
 Output JSON with these keys:
 - answer: str — natural language expert answer (3-8 sentences)
 - observed_facts: list[str]
@@ -111,6 +121,16 @@ CONVERSATION MEMORY RULES:
 - Verified facts come ONLY from the "Verified database context" section.
 - Prices, stock, references must come from database context, not from memory.
 - If uncertain, state clearly that the information is not verified.
+
+DEEP ANALYSIS RULES (apply when user asks to go deeper, list candidates, compare, or re-analyse):
+- NEVER repeat the same summary you already gave. If the user pushes for more, go further.
+- Enumerate ALL candidate buckets present in context: reliable, partial, weak.
+- For each candidate state: brand, title (truncated), price, score, and why confidence is limited.
+- Compare prices and brands across buckets to give a real market picture.
+- Explain WHY a score is low: vague specs, wrong brand, missing technical data, etc.
+- Give an opinionated recommendation even under uncertainty — just be explicit about confidence.
+- Never refuse to discuss weak/partial candidates — label them clearly and let the user decide.
+- If the user asks "which one is best", pick one and justify it, even if confidence is limited.
 
 Output JSON with these keys:
 - answer: str — natural language analysis (3-8 sentences)
@@ -231,6 +251,7 @@ class ChatOrchestrator:
             "product_name": product.name if product else None,
             "offers": resp.offers[:10] if resp.offers else [],
             "equivalents": resp.equivalents[:10] if resp.equivalents else [],
+            "weak_candidates": resp.weak_candidates[:10] if resp.weak_candidates else [],
             "price_analysis": resp.price_analysis.model_dump() if resp.price_analysis else None,
             "sources_used": resp.sources_used,
             "actions_triggered": actions,
@@ -499,29 +520,37 @@ class ChatOrchestrator:
         }
         if eq_analysis:
             cross_brand = eq_analysis.get("cross_brand_equivalents", [])
+            partial = eq_analysis.get("partial_spec_equivalents", [])
+            weak = eq_analysis.get("weak_candidates", [])
             best_match_score = eq_analysis.get("best_match_score")
+
+            def _candidate_entry(e: dict, bucket: str) -> dict:
+                return {
+                    "bucket": bucket,
+                    "title": e["title"][:80],
+                    "price": e["price"],
+                    "currency": e.get("currency", "EUR"),
+                    "brand": e.get("brand"),
+                    "score": e["score"],
+                    "spec_quality": e.get("spec_quality", 0),
+                    "is_vague": e.get("is_vague", False),
+                    "classification": e.get("classification", ""),
+                }
+
             product_context["equivalent_analysis"] = {
                 "candidate_count": eq_analysis.get("candidate_count", 0),
                 "valid_match_count": eq_analysis.get("valid_match_count", 0),
                 "best_match_score": best_match_score,
                 "price_confidence": eq_analysis.get("price_confidence"),
-                "cross_brand_count": len(cross_brand),
-                "partial_spec_count": len(eq_analysis.get("partial_spec_equivalents", [])),
-                "weak_candidate_count": len(eq_analysis.get("weak_candidates", [])),
-                "top_cross_brand": [
-                    {
-                        "title": e["title"][:60],
-                        "price": e["price"],
-                        "brand": e.get("brand"),
-                        "score": e["score"],
-                        "is_confirmed_exact": (
-                            e.get("is_same_brand", False) and e["score"] >= EXACT_MATCH_SCORE_THRESHOLD
-                        ),
-                    }
-                    for e in cross_brand[:3]
-                ],
                 "recommendation": eq_analysis.get("recommendation"),
                 "confidence_limited": best_match_score is not None and best_match_score < EXACT_MATCH_SCORE_THRESHOLD,
+                "reliable_candidates": [_candidate_entry(e, "reliable") for e in cross_brand[:10]],
+                "partial_candidates": [_candidate_entry(e, "partial") for e in partial[:10]],
+                "weak_candidates_sample": [_candidate_entry(e, "weak") for e in sorted(weak, key=lambda x: x.get("score", 0), reverse=True)[:10]],
+                "note": (
+                    "reliable = strong spec match; partial = incomplete specs; "
+                    "weak = vague or low-quality listings. All prices are indicative."
+                ),
             }
 
         conv_ctx = getattr(self, "_conversation_context", {})
@@ -529,6 +558,8 @@ class ChatOrchestrator:
             product_context["previous_offers_from_conversation"] = conv_ctx["offers"]
         if not (eq_analysis and eq_analysis.get("cross_brand_equivalents")) and conv_ctx.get("equivalents"):
             product_context["previous_equivalents_from_conversation"] = conv_ctx["equivalents"][:10]
+        if not (eq_analysis and eq_analysis.get("weak_candidates")) and conv_ctx.get("weak_candidates"):
+            product_context["previous_weak_candidates_from_conversation"] = conv_ctx["weak_candidates"][:10]
 
         current_msg = (
             f"Intent: {intent}\n"
@@ -677,6 +708,7 @@ class ChatOrchestrator:
 
         eq_analysis: dict | None = None
         equivalents: list[dict] = []
+        weak_candidates: list[dict] = []
         if intent in ANALYSIS_INTENTS:
             eq_analysis = await self._get_latest_equivalent_analysis(str(product.id))
             if eq_analysis:
@@ -686,6 +718,7 @@ class ChatOrchestrator:
                     eq_analysis.get("cross_brand_equivalents", [])
                     + eq_analysis.get("partial_spec_equivalents", [])
                 )
+                weak_candidates = eq_analysis.get("weak_candidates", [])
                 logger.info(
                     f"Equivalent analysis found | run_id={eq_analysis['run_id']} | "
                     f"cross_brand={len(eq_analysis.get('cross_brand_equivalents', []))} | "
@@ -705,6 +738,7 @@ class ChatOrchestrator:
             intent=intent,
             offers=offers,
             equivalents=equivalents,
+            weak_candidates=weak_candidates,
             price_analysis=price_analysis,
             market_analysis=MarketAnalysis(
                 observed_facts=answer_data.get("observed_facts", []),

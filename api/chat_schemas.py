@@ -39,6 +39,7 @@ class ChatResponse(BaseModel):
     product: ProductBrief = Field(default_factory=ProductBrief)
     products_found: list[ProductBrief] = []
     equivalents: list[dict] = []
+    weak_candidates: list[dict] = []
     offers: list[dict] = []
     price_analysis: PriceAnalysis = Field(default_factory=PriceAnalysis)
     market_analysis: MarketAnalysis = Field(default_factory=MarketAnalysis)

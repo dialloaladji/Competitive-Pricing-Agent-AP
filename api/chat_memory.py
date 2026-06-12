@@ -87,6 +87,7 @@ async def get_conversation_context(
     product_name = None
     offers: list = []
     equivalents: list = []
+    weak_candidates: list = []
     price_analysis = None
 
     for msg in assistant_msgs:
@@ -98,6 +99,8 @@ async def get_conversation_context(
             offers = meta["offers"]
         if not equivalents and meta.get("equivalents"):
             equivalents = meta["equivalents"]
+        if not weak_candidates and meta.get("weak_candidates"):
+            weak_candidates = meta["weak_candidates"]
         if price_analysis is None and meta.get("price_analysis"):
             price_analysis = meta["price_analysis"]
         if product_id and offers and equivalents:
@@ -110,6 +113,7 @@ async def get_conversation_context(
         "product_name": product_name,
         "offers": offers,
         "equivalents": equivalents,
+        "weak_candidates": weak_candidates,
         "price_analysis": price_analysis,
     }
 
