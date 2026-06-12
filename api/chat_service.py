@@ -35,17 +35,39 @@ ANALYSIS_INTENTS = {
 }
 
 DEEP_FOLLOWUP_KEYWORDS = [
+    # English
     "go deeper", "deeper", "more detail", "more details", "list all", "list candidates",
     "all candidates", "which one is best", "which is best", "best price", "all of them",
     "enumerate", "show all", "show me all", "weak", "partial", "dig deeper",
-    "expliquer", "analyse plus", "plus de detail", "plus de détail", "approfondir",
-    "all results", "every candidate", "every result", "detail",
+    "all results", "every candidate", "every result",
+    # French — deepening / elaboration requests
+    "plus de détail", "plus de detail", "plus d'info", "plus d'information",
+    "analyse plus", "analyser plus", "approfondir", "approfondis",
+    "développe", "développer", "expliquer", "explique moi",
+    "un peu plus", "encore plus", "creuse", "creuser",
+    "dis m'en plus", "dis moi plus", "donne moi plus", "donne-moi plus",
+    "plus en détail", "plus en detail",
+    "liste tous", "liste toutes", "montre moi tous", "montre tous",
+    "tous les candidats", "toutes les offres",
+    "meilleur rapport", "rapport qualité",
+    "créer un peu plus", "creer un peu plus",
 ]
 
 
 def _is_deep_followup(message: str) -> bool:
     msg_lower = message.lower()
     return any(kw in msg_lower for kw in DEEP_FOLLOWUP_KEYWORDS)
+
+
+def _extract_json(text: str) -> dict:
+    """Parse JSON from LLM response, stripping markdown fences if present."""
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        # Remove first line (``` or ```json) and last line (```)
+        inner = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
+        text = inner.strip()
+    return json.loads(text)
 
 # Minimum score threshold for classifying an offer as an exact source-product match
 EXACT_MATCH_SCORE_THRESHOLD = 0.88
@@ -292,7 +314,7 @@ class ChatOrchestrator:
             return result["intent"], result["confidence"]
         try:
             resp = await self.llm.chat(SYSTEM_INTENT_PROMPT, f"Question: {message}")
-            data = json.loads(resp["content"])
+            data = _extract_json(resp["content"])
             return data.get("intent", "general_question"), data.get("confidence", 0.5)
         except Exception:
             return "general_question", 0.3
@@ -577,13 +599,19 @@ class ChatOrchestrator:
         if not (eq_analysis and eq_analysis.get("weak_candidates")) and conv_ctx.get("weak_candidates"):
             product_context["previous_weak_candidates_from_conversation"] = conv_ctx["weak_candidates"][:10]
 
-        current_msg = (
-            f"{user_message}\n\n"
-            f"[System: intent={intent}, product={product.name}]"
-        ) if user_message else (
-            f"Intent: {intent}\n"
-            f"Provide a detailed analysis for product: {product.name}."
-        )
+        if user_message:
+            deep = _is_deep_followup(user_message)
+            extra = (
+                "\n[System instruction: enumerate every candidate from equivalent_analysis "
+                "inline in the answer field using bullet points — do not summarize or skip any.]"
+                if deep else ""
+            )
+            current_msg = f"{user_message}{extra}\n\n[System: intent={intent}, product={product.name}]"
+        else:
+            current_msg = (
+                f"Intent: {intent}\n"
+                f"Provide a detailed analysis for product: {product.name}."
+            )
         context_messages = build_chat_context(
             SYSTEM_ANSWER_PROMPT,
             getattr(self, "_conversation_summary", None),
@@ -593,21 +621,38 @@ class ChatOrchestrator:
         )
         try:
             resp = await self.llm.chat_messages(context_messages)
-            return json.loads(resp["content"])
+            return _extract_json(resp["content"])
         except Exception as _gen_err:
             logger.error(f"_generate_answer LLM call failed: {_gen_err!r}", exc_info=True)
+            # Build a richer fallback that at least shows offers + candidates
+            min_p = min((o["price"] for o in offers), default=0)
+            max_p = max((o["price"] for o in offers), default=0)
+            fallback_lines = [
+                f"{product.name} — {len(offers)} confirmed offer(s). "
+                f"Price range: €{min_p:.2f}–€{max_p:.2f}."
+            ]
+            if eq_analysis:
+                cross = eq_analysis.get("cross_brand_equivalents", [])
+                partial_list = eq_analysis.get("partial_spec_equivalents", [])
+                weak_list = eq_analysis.get("weak_candidates", [])
+                all_cands = (
+                    [("reliable", e) for e in cross]
+                    + [("partial", e) for e in partial_list]
+                    + [("weak", e) for e in weak_list]
+                )
+                if all_cands:
+                    fallback_lines.append(f"\n{len(all_cands)} market candidates found:")
+                    for bucket, e in all_cands[:12]:
+                        fallback_lines.append(
+                            f"• [{bucket}] {e.get('title', '')[:60]} — €{e.get('price', 0):.2f} — score={e.get('score', 0):.2f}"
+                        )
             return {
-                "answer": f"The product {product.name} was found with {len(offers)} confirmed offer(s). "
-                          f"Price range: €{min((o['price'] for o in offers), default=0):.2f} - "
-                          f"€{max((o['price'] for o in offers), default=0):.2f}. "
-                          f"{'Price history is available (' + price_analysis.trend + ' trend).' if price_analysis.has_history else 'No price history available.'}",
+                "answer": "\n".join(fallback_lines),
                 "observed_facts": [f"Product found: {product.name}", f"{len(offers)} exact offers found"],
                 "hypotheses": [],
                 "risks": [],
-                "recommendations": [
-                    "Add product to watchlist for price tracking" if not price_analysis.has_history else "Monitor price trend"
-                ],
-                "confidence": "medium",
+                "recommendations": ["Verify specs match your needs before purchasing equivalent"],
+                "confidence": "low",
                 "missing_information": ["price_history"] if not price_analysis.has_history else [],
                 "sources_used": ["database"],
             }
@@ -1062,7 +1107,7 @@ class ChatOrchestrator:
         )
         try:
             resp = await self.llm.chat_messages(context_messages)
-            data = json.loads(resp["content"])
+            data = _extract_json(resp["content"])
             data["sources_used"] = sources
             return data
         except Exception:
