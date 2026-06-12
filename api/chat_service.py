@@ -64,10 +64,50 @@ def _extract_json(text: str) -> dict:
     text = text.strip()
     if text.startswith("```"):
         lines = text.splitlines()
-        # Remove first line (``` or ```json) and last line (```)
         inner = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
         text = inner.strip()
     return json.loads(text)
+
+
+def _stream_extract_answer(state: dict, new_text: str) -> str:
+    """
+    Incrementally extract the 'answer' string value from a streaming JSON response.
+    state = {"buf": str, "in_answer": bool, "done": bool, "esc": bool}
+    Returns displayable text decoded from the answer value.
+    """
+    import re
+    if state["done"]:
+        return ""
+    state["buf"] += new_text
+    display: list[str] = []
+    if not state["in_answer"]:
+        m = re.search(r'"answer"\s*:\s*"', state["buf"])
+        if not m:
+            return ""
+        state["in_answer"] = True
+        remaining = state["buf"][m.end():]
+        state["buf"] = ""
+        new_text = remaining
+    for c in new_text:
+        if state["done"]:
+            break
+        if state["esc"]:
+            if c == "n":
+                display.append("\n")
+            elif c == "t":
+                display.append("\t")
+            elif c in ('"', "\\", "/"):
+                display.append(c)
+            else:
+                display.append(c)
+            state["esc"] = False
+        elif c == "\\":
+            state["esc"] = True
+        elif c == '"':
+            state["done"] = True
+        else:
+            display.append(c)
+    return "".join(display)
 
 # Minimum score threshold for classifying an offer as an exact source-product match
 EXACT_MATCH_SCORE_THRESHOLD = 0.88
@@ -308,6 +348,382 @@ class ChatOrchestrator:
         )
         return resp
 
+    async def process_stream(
+        self,
+        message: str,
+        product_id: str | None = None,
+        conversation_id: str | None = None,
+        user_id: str | None = None,
+    ):
+        """Async generator yielding SSE-style dicts:
+          {"type": "thinking", "text": "..."}
+          {"type": "token", "text": "..."}   ← streams the answer
+          {"type": "done", "data": {...}}    ← full ChatResponse payload
+        """
+        def thinking(text: str, step: str = "") -> dict:
+            return {"type": "thinking", "step": step, "text": text}
+
+        actions: list[str] = []
+        sources: list[str] = []
+
+        conv, conv_action = await get_or_create_conversation(self.db, conversation_id, user_id, message)
+        conversation_id = str(conv.id)
+        self._current_conversation_id = conversation_id
+        await save_message(self.db, conversation_id, "user", message)
+        actions.extend([f"conversation_{conv_action}", "user_message_saved"])
+
+        conv_context = await get_conversation_context(self.db, conversation_id)
+        self._conversation_summary = conv_context["summary"]
+        recent = conv_context["recent_messages"]
+        self._recent_messages = recent[:-1] if recent else []
+        self._conversation_context = conv_context
+
+        if not product_id and conv_action == "existing" and conv_context.get("product_id"):
+            product_id = conv_context["product_id"]
+            actions.append("product_id_reused_from_conversation")
+
+        yield thinking("Classification de l'intention…", "intent")
+        intent, intent_conf = await self._classify_intent(message)
+        yield thinking(f"Intention : {intent} ({intent_conf:.0%})", "intent_done")
+        sources.append("intent_classifier")
+        actions.append(f"intent_classified_as_{intent}")
+
+        yield thinking("Recherche du produit…", "product")
+        product = None
+        if product_id:
+            product = await self._get_product_by_id(product_id)
+            sources.append("database")
+            actions.append("product_lookup_by_id")
+            if not product:
+                actions.append("product_id_not_found")
+        if not product:
+            candidates = await self._search_product_in_db(message)
+            if candidates:
+                product = candidates[0]
+                sources.append("database")
+                actions.append("product_found_by_search")
+        if product:
+            yield thinking(f"Produit : {product.name[:60]}", "product_found")
+        else:
+            yield thinking("Produit non trouvé — recherche sur le marché…", "no_product")
+
+        # ── product found path ──────────────────────────────────────────
+        resp: ChatResponse
+        if product:
+            yield thinking("Récupération des offres…", "offers")
+            offers = await self._get_offers(str(product.id))
+            price_history = await self._get_price_history(str(product.id))
+            sources.extend(["offers", "price_history"] if price_history else ["offers"])
+            if price_history:
+                actions.append("price_history_retrieved")
+            yield thinking(f"{len(offers)} offre(s) trouvée(s)", "offers_done")
+
+            eq_analysis: dict | None = None
+            equivalents: list[dict] = []
+            weak_candidates: list[dict] = []
+            trigger_analysis = intent in ANALYSIS_INTENTS or _is_deep_followup(message)
+            if trigger_analysis:
+                yield thinking("Récupération de l'analyse d'équivalents…", "analysis")
+                eq_analysis = await self._get_latest_equivalent_analysis(str(product.id))
+                if eq_analysis:
+                    yield thinking(
+                        f"Analyse : {eq_analysis['candidate_count']} candidats "
+                        f"(score max {eq_analysis.get('best_match_score', 0) or 0:.2f})",
+                        "analysis_done",
+                    )
+                    sources.append("equivalent_analysis")
+                    actions.append("equivalent_analysis_retrieved")
+                    equivalents = (
+                        eq_analysis.get("cross_brand_equivalents", [])
+                        + eq_analysis.get("partial_spec_equivalents", [])
+                    )
+                    weak_candidates = eq_analysis.get("weak_candidates", [])
+                    stored_total = len(equivalents) + len(weak_candidates)
+                    if _is_deep_followup(message) and stored_total < 3:
+                        yield thinking("Peu de données stockées — recherche live…", "live_search")
+                        live = await self._live_eq_search(product)
+                        if live:
+                            sources.append("serpapi")
+                            actions.append("live_augmentation_completed")
+                            eq_analysis = {
+                                **eq_analysis,
+                                "cross_brand_equivalents": (
+                                    eq_analysis.get("cross_brand_equivalents", [])
+                                    + live.get("cross_brand_equivalents", [])
+                                ),
+                                "partial_spec_equivalents": (
+                                    eq_analysis.get("partial_spec_equivalents", [])
+                                    + live.get("partial_spec_equivalents", [])
+                                ),
+                                "weak_candidates": (
+                                    eq_analysis.get("weak_candidates", [])
+                                    + live.get("weak_candidates", [])
+                                ),
+                            }
+                            equivalents = (
+                                eq_analysis.get("cross_brand_equivalents", [])
+                                + eq_analysis.get("partial_spec_equivalents", [])
+                            )
+                            weak_candidates = eq_analysis.get("weak_candidates", [])
+                            yield thinking(
+                                f"Live : {live['candidate_count']} candidats supplémentaires",
+                                "live_done",
+                            )
+                else:
+                    actions.append("no_db_analysis_triggering_live_search")
+                    yield thinking("Pas d'analyse en cache — recherche live…", "live_search")
+                    eq_analysis = await self._live_eq_search(product)
+                    if eq_analysis:
+                        sources.append("serpapi")
+                        actions.append("live_equivalent_search_completed")
+                        equivalents = (
+                            eq_analysis.get("cross_brand_equivalents", [])
+                            + eq_analysis.get("partial_spec_equivalents", [])
+                        )
+                        weak_candidates = eq_analysis.get("weak_candidates", [])
+                        yield thinking(
+                            f"Live : {eq_analysis['candidate_count']} candidats trouvés",
+                            "live_done",
+                        )
+                    else:
+                        actions.append("live_search_also_failed")
+
+            yield thinking("Génération de la réponse…", "generating")
+            price_analysis = self._compute_price_analysis(product, price_history)
+
+            if self.is_mock:
+                result = self._mock_answer(product, offers, price_analysis, intent, eq_analysis)
+                yield {"type": "token", "text": result["answer"]}
+                answer_data = result
+            else:
+                product_context = self._build_product_context(
+                    product, offers, price_history, price_analysis, intent, eq_analysis, message
+                )
+                context_messages = build_chat_context(
+                    SYSTEM_ANSWER_PROMPT,
+                    self._conversation_summary,
+                    self._recent_messages,
+                    product_context,
+                    self._build_current_msg(message, intent, product.name),
+                )
+                full_content = ""
+                stream_state = {"buf": "", "in_answer": False, "done": False, "esc": False}
+                try:
+                    async for token in self.llm.stream_chat_messages(context_messages):
+                        full_content += token
+                        visible = _stream_extract_answer(stream_state, token)
+                        if visible:
+                            yield {"type": "token", "text": visible}
+                    answer_data = _extract_json(full_content)
+                except Exception as e:
+                    logger.error(f"process_stream LLM failed: {e!r}", exc_info=True)
+                    answer_data = self._stream_fallback(product, offers, price_analysis, eq_analysis)
+                    yield {"type": "token", "text": answer_data["answer"]}
+
+            missing = answer_data.get("missing_information", [])
+            if not price_history and "price_history" not in missing:
+                missing.append("price_history")
+            resp = ChatResponse(
+                answer=answer_data.get("answer", ""),
+                intent=intent,
+                offers=offers,
+                equivalents=equivalents,
+                weak_candidates=weak_candidates,
+                price_analysis=price_analysis,
+                market_analysis=MarketAnalysis(
+                    observed_facts=answer_data.get("observed_facts", []),
+                    hypotheses=answer_data.get("hypotheses", []),
+                    risks=answer_data.get("risks", []),
+                    recommendations=answer_data.get("recommendations", []),
+                ),
+                confidence=answer_data.get("confidence", "medium"),
+                sources_used=list(set(sources)),
+                actions_triggered=actions,
+                missing_information=missing,
+            )
+            resp.product = ProductBrief(
+                id=str(product.id), name=product.name,
+                brand=product.brand, category=product.category,
+                reference=product.sku,
+            )
+            resp.product_id = str(product.id)
+
+        # ── no product path ─────────────────────────────────────────────
+        else:
+            if not _is_electrical(message):
+                resp = ChatResponse(
+                    answer="Je suis spécialisé en produits électriques. Pouvez-vous fournir une référence avec marque et specs ? (ex: Disjoncteur Legrand 16A 6kA)",
+                    intent=intent, confidence="low",
+                    sources_used=sources, actions_triggered=actions,
+                    missing_information=["electrical_product_description"],
+                )
+            else:
+                yield thinking("Recherche Google Shopping…", "serp_search")
+                try:
+                    inferred = _infer_product_attributes(description=message)
+                except Exception:
+                    inferred = {}
+                answer_data, scored = await self._trigger_equivalent_analysis(message, inferred)
+                products_found = [
+                    ProductBrief(name=s.get("title", "")[:100], brand=s.get("brand"))
+                    for s in scored[:5] if s.get("title")
+                ]
+                yield thinking(f"{len(scored)} résultats scorés", "serp_done")
+                resp = ChatResponse(
+                    answer=answer_data.get("answer", ""),
+                    intent=intent,
+                    products_found=products_found,
+                    market_analysis=MarketAnalysis(
+                        observed_facts=answer_data.get("observed_facts", []),
+                        hypotheses=answer_data.get("hypotheses", []),
+                        risks=answer_data.get("risks", []),
+                        recommendations=answer_data.get("recommendations", []),
+                    ),
+                    confidence=answer_data.get("confidence", "low"),
+                    sources_used=list(set(sources + answer_data.get("sources_used", []))),
+                    actions_triggered=actions + ["equivalent_analysis_triggered"],
+                    missing_information=answer_data.get("missing_information", []),
+                )
+                for token in resp.answer.split():
+                    yield {"type": "token", "text": token + " "}
+
+        # ── persist and finish ──────────────────────────────────────────
+        assistant_metadata = {
+            "product_id": str(product.id) if product else None,
+            "product_name": product.name if product else None,
+            "offers": resp.offers[:10],
+            "equivalents": resp.equivalents[:10],
+            "weak_candidates": resp.weak_candidates[:10],
+            "price_analysis": resp.price_analysis.model_dump() if resp.price_analysis else None,
+            "sources_used": resp.sources_used,
+            "actions_triggered": actions,
+        }
+        assistant_msg = await save_message(
+            self.db, conversation_id, "assistant", resp.answer, metadata=assistant_metadata
+        )
+        await maybe_update_conversation_summary(self.db, conversation_id, self.llm)
+        resp.conversation_id = conversation_id
+        resp.message_id = str(assistant_msg.id)
+        resp.intent = intent
+        yield {"type": "done", "data": resp.model_dump()}
+
+    # ── helpers shared by process() and process_stream() ────────────────
+
+    def _build_product_context(
+        self,
+        product: Product,
+        offers: list[dict],
+        price_history: list[dict],
+        price_analysis: "PriceAnalysis",
+        intent: str,
+        eq_analysis: dict | None,
+        user_message: str | None = None,
+    ) -> dict:
+        ctx: dict = {
+            "product": product.name,
+            "brand": product.brand,
+            "category": product.category,
+            "sku": product.sku,
+            "specs": {
+                "current_a": product.current_a,
+                "poles": product.poles,
+                "curve": product.curve,
+                "breaking_capacity_ka": product.breaking_capacity_ka,
+            },
+            "exact_offers_count": len(offers),
+            "exact_offers": [
+                {"price": o["price"], "merchant": o.get("merchant"), "in_stock": o.get("in_stock")}
+                for o in offers[:10]
+            ],
+            "price_history": {
+                "has_data": price_analysis.has_history,
+                "min_price": price_analysis.min_price,
+                "max_price": price_analysis.max_price,
+                "median_price": price_analysis.median_price,
+                "trend": price_analysis.trend,
+            },
+            "intent": intent,
+        }
+        if eq_analysis:
+            cross_brand = eq_analysis.get("cross_brand_equivalents", [])
+            partial = eq_analysis.get("partial_spec_equivalents", [])
+            weak = eq_analysis.get("weak_candidates", [])
+
+            def _entry(e: dict, bucket: str) -> dict:
+                return {
+                    "bucket": bucket, "title": e["title"][:80], "price": e["price"],
+                    "currency": e.get("currency", "EUR"), "brand": e.get("brand"),
+                    "score": e["score"], "spec_quality": e.get("spec_quality", 0),
+                    "is_vague": e.get("is_vague", False), "classification": e.get("classification", ""),
+                }
+
+            best_score = eq_analysis.get("best_match_score")
+            ctx["equivalent_analysis"] = {
+                "candidate_count": eq_analysis.get("candidate_count", 0),
+                "valid_match_count": eq_analysis.get("valid_match_count", 0),
+                "best_match_score": best_score,
+                "price_confidence": eq_analysis.get("price_confidence"),
+                "recommendation": eq_analysis.get("recommendation"),
+                "confidence_limited": best_score is not None and best_score < EXACT_MATCH_SCORE_THRESHOLD,
+                "reliable_candidates": [_entry(e, "reliable") for e in cross_brand[:10]],
+                "partial_candidates": [_entry(e, "partial") for e in partial[:10]],
+                "weak_candidates_sample": [
+                    _entry(e, "weak")
+                    for e in sorted(weak, key=lambda x: x.get("score", 0), reverse=True)[:10]
+                ],
+                "note": "reliable = strong spec match; partial = incomplete specs; weak = vague or low-quality",
+            }
+        conv_ctx = getattr(self, "_conversation_context", {})
+        if not offers and conv_ctx.get("offers"):
+            ctx["previous_offers_from_conversation"] = conv_ctx["offers"]
+        if not (eq_analysis and eq_analysis.get("cross_brand_equivalents")) and conv_ctx.get("equivalents"):
+            ctx["previous_equivalents_from_conversation"] = conv_ctx["equivalents"][:10]
+        if not (eq_analysis and eq_analysis.get("weak_candidates")) and conv_ctx.get("weak_candidates"):
+            ctx["previous_weak_candidates_from_conversation"] = conv_ctx["weak_candidates"][:10]
+        return ctx
+
+    def _build_current_msg(self, user_message: str | None, intent: str, product_name: str) -> str:
+        if user_message:
+            deep = _is_deep_followup(user_message)
+            extra = (
+                "\n[System instruction: enumerate every candidate from equivalent_analysis "
+                "inline in the answer field using bullet points — do not summarize or skip any.]"
+                if deep else ""
+            )
+            return f"{user_message}{extra}\n\n[System: intent={intent}, product={product_name}]"
+        return f"Intent: {intent}\nProvide a detailed analysis for product: {product_name}."
+
+    def _stream_fallback(
+        self, product: Product, offers: list[dict],
+        price_analysis: "PriceAnalysis", eq_analysis: dict | None,
+    ) -> dict:
+        min_p = min((o["price"] for o in offers), default=0)
+        max_p = max((o["price"] for o in offers), default=0)
+        lines = [
+            f"{product.name} — {len(offers)} offre(s). Prix : €{min_p:.2f}–€{max_p:.2f}."
+        ]
+        if eq_analysis:
+            all_cands = (
+                [("reliable", e) for e in eq_analysis.get("cross_brand_equivalents", [])]
+                + [("partial", e) for e in eq_analysis.get("partial_spec_equivalents", [])]
+                + [("weak", e) for e in eq_analysis.get("weak_candidates", [])]
+            )
+            if all_cands:
+                lines.append(f"\n{len(all_cands)} candidats trouvés :")
+                for bucket, e in all_cands[:12]:
+                    lines.append(
+                        f"• [{bucket}] {e.get('title', '')[:60]} — €{e.get('price', 0):.2f} — score={e.get('score', 0):.2f}"
+                    )
+        return {
+            "answer": "\n".join(lines),
+            "observed_facts": [f"{len(offers)} offres exactes"],
+            "hypotheses": [], "risks": [],
+            "recommendations": ["Vérifiez les specs avant achat"],
+            "confidence": "low",
+            "missing_information": [],
+            "sources_used": ["database"],
+        }
+
     async def _classify_intent(self, message: str) -> tuple[str, float]:
         if self.is_mock:
             result = _mock_intent(message)
@@ -531,87 +947,10 @@ class ChatOrchestrator:
         price_analysis = self._compute_price_analysis(product, price_history)
         if self.is_mock:
             return self._mock_answer(product, offers, price_analysis, intent, eq_analysis)
-        product_context = {
-            "product": product.name,
-            "brand": product.brand,
-            "category": product.category,
-            "sku": product.sku,
-            "specs": {
-                "current_a": product.current_a,
-                "poles": product.poles,
-                "curve": product.curve,
-                "breaking_capacity_ka": product.breaking_capacity_ka,
-            },
-            "exact_offers_count": len(offers),
-            "exact_offers": [
-                {"price": o["price"], "merchant": o.get("merchant"), "in_stock": o.get("in_stock")}
-                for o in offers[:10]
-            ],
-            "price_history": {
-                "has_data": price_analysis.has_history,
-                "min_price": price_analysis.min_price,
-                "max_price": price_analysis.max_price,
-                "median_price": price_analysis.median_price,
-                "trend": price_analysis.trend,
-            },
-            "intent": intent,
-        }
-        if eq_analysis:
-            cross_brand = eq_analysis.get("cross_brand_equivalents", [])
-            partial = eq_analysis.get("partial_spec_equivalents", [])
-            weak = eq_analysis.get("weak_candidates", [])
-            best_match_score = eq_analysis.get("best_match_score")
-
-            def _candidate_entry(e: dict, bucket: str) -> dict:
-                return {
-                    "bucket": bucket,
-                    "title": e["title"][:80],
-                    "price": e["price"],
-                    "currency": e.get("currency", "EUR"),
-                    "brand": e.get("brand"),
-                    "score": e["score"],
-                    "spec_quality": e.get("spec_quality", 0),
-                    "is_vague": e.get("is_vague", False),
-                    "classification": e.get("classification", ""),
-                }
-
-            product_context["equivalent_analysis"] = {
-                "candidate_count": eq_analysis.get("candidate_count", 0),
-                "valid_match_count": eq_analysis.get("valid_match_count", 0),
-                "best_match_score": best_match_score,
-                "price_confidence": eq_analysis.get("price_confidence"),
-                "recommendation": eq_analysis.get("recommendation"),
-                "confidence_limited": best_match_score is not None and best_match_score < EXACT_MATCH_SCORE_THRESHOLD,
-                "reliable_candidates": [_candidate_entry(e, "reliable") for e in cross_brand[:10]],
-                "partial_candidates": [_candidate_entry(e, "partial") for e in partial[:10]],
-                "weak_candidates_sample": [_candidate_entry(e, "weak") for e in sorted(weak, key=lambda x: x.get("score", 0), reverse=True)[:10]],
-                "note": (
-                    "reliable = strong spec match; partial = incomplete specs; "
-                    "weak = vague or low-quality listings. All prices are indicative."
-                ),
-            }
-
-        conv_ctx = getattr(self, "_conversation_context", {})
-        if not offers and conv_ctx.get("offers"):
-            product_context["previous_offers_from_conversation"] = conv_ctx["offers"]
-        if not (eq_analysis and eq_analysis.get("cross_brand_equivalents")) and conv_ctx.get("equivalents"):
-            product_context["previous_equivalents_from_conversation"] = conv_ctx["equivalents"][:10]
-        if not (eq_analysis and eq_analysis.get("weak_candidates")) and conv_ctx.get("weak_candidates"):
-            product_context["previous_weak_candidates_from_conversation"] = conv_ctx["weak_candidates"][:10]
-
-        if user_message:
-            deep = _is_deep_followup(user_message)
-            extra = (
-                "\n[System instruction: enumerate every candidate from equivalent_analysis "
-                "inline in the answer field using bullet points — do not summarize or skip any.]"
-                if deep else ""
-            )
-            current_msg = f"{user_message}{extra}\n\n[System: intent={intent}, product={product.name}]"
-        else:
-            current_msg = (
-                f"Intent: {intent}\n"
-                f"Provide a detailed analysis for product: {product.name}."
-            )
+        product_context = self._build_product_context(
+            product, offers, price_history, price_analysis, intent, eq_analysis, user_message
+        )
+        current_msg = self._build_current_msg(user_message, intent, product.name)
         context_messages = build_chat_context(
             SYSTEM_ANSWER_PROMPT,
             getattr(self, "_conversation_summary", None),

@@ -1,6 +1,8 @@
+import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,6 +39,40 @@ async def chat_endpoint(
         raise HTTPException(status_code=500, detail="Chat processing failed")
     finally:
         await llm.close()
+
+
+@router.post("/chat/stream")
+async def chat_stream_endpoint(
+    data: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """SSE streaming endpoint. Each event is a JSON line prefixed with 'data: '."""
+    if not data.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    llm = get_llm_client()
+
+    async def event_generator():
+        try:
+            orch = ChatOrchestrator(db=db, llm=llm)
+            async for event in orch.process_stream(
+                message=data.message,
+                product_id=data.product_id,
+                conversation_id=data.conversation_id,
+                user_id=data.user_id,
+            ):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            logger.error(f"Stream error: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'text': str(e)})}\n\n"
+        finally:
+            await llm.close()
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/chat/conversations")

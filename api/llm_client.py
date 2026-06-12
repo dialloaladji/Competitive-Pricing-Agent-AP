@@ -114,6 +114,36 @@ class GroqClient:
             "model": self.model,
         }
 
+    async def stream_chat_messages(self, messages: list[dict], max_tokens: int | None = None):
+        """Yield raw text tokens from a streaming chat completion."""
+        async with self.client.stream(
+            "POST",
+            f"{self.base_url}/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            json={
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": max_tokens or settings.llm_max_tokens,
+                "temperature": 0.1,
+                "stream": True,
+                "response_format": {"type": "json_object"},
+            },
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    return
+                try:
+                    data = json.loads(data_str)
+                    content = data["choices"][0]["delta"].get("content")
+                    if content:
+                        yield content
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+
     async def close(self):
         await self.client.aclose()
 
@@ -138,6 +168,10 @@ class MockClient:
 
     async def chat_messages(self, messages: list[dict], max_tokens: int | None = None) -> dict[str, Any]:
         return await self.chat("", "")
+
+    async def stream_chat_messages(self, messages: list[dict], max_tokens: int | None = None):
+        mock_result = await self.chat("", "")
+        yield mock_result["content"]
 
     async def close(self):
         pass
