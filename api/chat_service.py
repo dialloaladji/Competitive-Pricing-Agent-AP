@@ -34,6 +34,19 @@ ANALYSIS_INTENTS = {
     "market_analysis",
 }
 
+DEEP_FOLLOWUP_KEYWORDS = [
+    "go deeper", "deeper", "more detail", "more details", "list all", "list candidates",
+    "all candidates", "which one is best", "which is best", "best price", "all of them",
+    "enumerate", "show all", "show me all", "weak", "partial", "dig deeper",
+    "expliquer", "analyse plus", "plus de detail", "plus de détail", "approfondir",
+    "all results", "every candidate", "every result", "detail",
+]
+
+
+def _is_deep_followup(message: str) -> bool:
+    msg_lower = message.lower()
+    return any(kw in msg_lower for kw in DEEP_FOLLOWUP_KEYWORDS)
+
 # Minimum score threshold for classifying an offer as an exact source-product match
 EXACT_MATCH_SCORE_THRESHOLD = 0.88
 
@@ -80,16 +93,17 @@ CONVERSATION MEMORY RULES:
 
 DEEP ANALYSIS RULES (apply when user asks to go deeper, list candidates, compare, or re-analyse):
 - NEVER repeat the same summary you already gave. If the user pushes for more, go further.
-- Enumerate ALL candidate buckets present in context: reliable, partial, weak.
-- For each candidate state: brand, title (truncated), price, score, and why confidence is limited.
-- Compare prices and brands across buckets to give a real market picture.
+- Enumerate ALL candidate buckets present in context: reliable_candidates, partial_candidates, weak_candidates_sample.
+- For EACH candidate write one line inside `answer` using the actual data values: "• [bucket] <actual product title from data, max 60 chars> — €<actual price> — score=<actual score> — <specific reason why confidence is limited>".
+- Do NOT end `answer` with a colon or a heading sentence that promises a list but delivers nothing.
+- Put ALL enumeration inline inside the `answer` string — not in observed_facts.
 - Explain WHY a score is low: vague specs, wrong brand, missing technical data, etc.
 - Give an opinionated recommendation even under uncertainty — just be explicit about confidence.
 - Never refuse to discuss weak/partial candidates — label them clearly and let the user decide.
 - If the user asks "which one is best", pick one and justify it, even if confidence is limited.
 
 Output JSON with these keys:
-- answer: str — natural language expert answer (3-8 sentences)
+- answer: str — natural language expert answer (as long as needed to fully enumerate candidates; minimum 5 sentences when candidates are available)
 - observed_facts: list[str]
 - hypotheses: list[str]
 - risks: list[str]
@@ -124,16 +138,17 @@ CONVERSATION MEMORY RULES:
 
 DEEP ANALYSIS RULES (apply when user asks to go deeper, list candidates, compare, or re-analyse):
 - NEVER repeat the same summary you already gave. If the user pushes for more, go further.
-- Enumerate ALL candidate buckets present in context: reliable, partial, weak.
-- For each candidate state: brand, title (truncated), price, score, and why confidence is limited.
-- Compare prices and brands across buckets to give a real market picture.
+- Enumerate ALL candidate buckets present in context: reliable_candidates, partial_candidates, weak_candidates_sample.
+- For EACH candidate write one line inside `answer` using the actual data values: "• [bucket] <actual product title from data, max 60 chars> — €<actual price> — score=<actual score> — <specific reason why confidence is limited>".
+- Do NOT end `answer` with a colon or a heading sentence that promises a list but delivers nothing.
+- Put ALL enumeration inline inside the `answer` string — not in observed_facts.
 - Explain WHY a score is low: vague specs, wrong brand, missing technical data, etc.
 - Give an opinionated recommendation even under uncertainty — just be explicit about confidence.
 - Never refuse to discuss weak/partial candidates — label them clearly and let the user decide.
 - If the user asks "which one is best", pick one and justify it, even if confidence is limited.
 
 Output JSON with these keys:
-- answer: str — natural language analysis (3-8 sentences)
+- answer: str — natural language analysis (as long as needed to fully enumerate candidates; minimum 5 sentences when candidates are available)
 - observed_facts: list[str]
 - hypotheses: list[str]
 - risks: list[str]
@@ -489,6 +504,7 @@ class ChatOrchestrator:
         price_history: list[dict],
         intent: str,
         eq_analysis: dict | None = None,
+        user_message: str | None = None,
     ) -> dict:
         price_analysis = self._compute_price_analysis(product, price_history)
         if self.is_mock:
@@ -562,6 +578,9 @@ class ChatOrchestrator:
             product_context["previous_weak_candidates_from_conversation"] = conv_ctx["weak_candidates"][:10]
 
         current_msg = (
+            f"{user_message}\n\n"
+            f"[System: intent={intent}, product={product.name}]"
+        ) if user_message else (
             f"Intent: {intent}\n"
             f"Provide a detailed analysis for product: {product.name}."
         )
@@ -575,7 +594,8 @@ class ChatOrchestrator:
         try:
             resp = await self.llm.chat_messages(context_messages)
             return json.loads(resp["content"])
-        except Exception:
+        except Exception as _gen_err:
+            logger.error(f"_generate_answer LLM call failed: {_gen_err!r}", exc_info=True)
             return {
                 "answer": f"The product {product.name} was found with {len(offers)} confirmed offer(s). "
                           f"Price range: €{min((o['price'] for o in offers), default=0):.2f} - "
@@ -695,6 +715,67 @@ class ChatOrchestrator:
             "sources_used": ["database", "equivalent_analysis"] if eq_analysis else ["database"],
         }
 
+    async def _live_eq_search(self, product: Product) -> dict | None:
+        """Live SerpAPI search for equivalents when no DB analysis run exists."""
+        query = f"{product.name} {product.brand or ''}".strip()[:200]
+        try:
+            results = await search_serpapi(query)
+        except Exception as e:
+            logger.warning(f"Live SerpAPI search failed: {e}")
+            return None
+        if not results:
+            return None
+        try:
+            normalized = normalize_candidates(results)
+            scored = score_candidates(product, normalized)
+        except Exception:
+            scored = []
+
+        cross_brand: list[dict] = []
+        partial: list[dict] = []
+        weak: list[dict] = []
+        for s in scored:
+            score = s.get("score", 0)
+            is_same_brand = s.get("is_same_brand", False)
+            is_vague = s.get("is_vague", False)
+            spec_quality = s.get("spec_quality", 0)
+            entry = {
+                "title": s.get("title", ""),
+                "price": s.get("price", 0),
+                "currency": s.get("currency", "EUR"),
+                "merchant": s.get("merchant", ""),
+                "url": s.get("url", ""),
+                "score": score,
+                "spec_quality": spec_quality,
+                "classification": s.get("classification", "functional_equivalent"),
+                "spec_match": s.get("spec_match", ""),
+                "is_vague": is_vague,
+                "brand": s.get("brand"),
+                "is_same_brand": is_same_brand,
+            }
+            if is_same_brand:
+                continue  # confirmed exact match — already in offers
+            if score >= EXACT_MATCH_SCORE_THRESHOLD and not is_vague:
+                cross_brand.append(entry)
+            elif spec_quality >= 0.25 and not is_vague:
+                partial.append(entry)
+            else:
+                weak.append(entry)
+
+        best_score = max((s.get("score", 0) for s in scored), default=None)
+        valid = [s for s in scored if s.get("score", 0) >= EXACT_MATCH_SCORE_THRESHOLD]
+        return {
+            "run_id": "live_search",
+            "candidate_count": len(results),
+            "valid_match_count": len(valid),
+            "cross_brand_equivalents": cross_brand,
+            "partial_spec_equivalents": partial,
+            "weak_candidates": weak,
+            "best_match_score": best_score,
+            "price_confidence": "low" if not valid else "medium",
+            "recommendation": None,
+        }
+
     async def _handle_product_found(
         self, product: Product, message: str, intent: str,
         sources: list[str], actions: list[str],
@@ -709,7 +790,8 @@ class ChatOrchestrator:
         eq_analysis: dict | None = None
         equivalents: list[dict] = []
         weak_candidates: list[dict] = []
-        if intent in ANALYSIS_INTENTS:
+        trigger_analysis = intent in ANALYSIS_INTENTS or _is_deep_followup(message)
+        if trigger_analysis:
             eq_analysis = await self._get_latest_equivalent_analysis(str(product.id))
             if eq_analysis:
                 sources.append("equivalent_analysis")
@@ -725,10 +807,61 @@ class ChatOrchestrator:
                     f"partial={len(eq_analysis.get('partial_spec_equivalents', []))} | "
                     f"weak={len(eq_analysis.get('weak_candidates', []))}"
                 )
+                # If DB has sparse stored candidates and user is explicitly asking to enumerate,
+                # augment with a live search to give the LLM real candidates to discuss.
+                stored_total = (
+                    len(eq_analysis.get("cross_brand_equivalents", []))
+                    + len(eq_analysis.get("partial_spec_equivalents", []))
+                    + len(eq_analysis.get("weak_candidates", []))
+                )
+                if _is_deep_followup(message) and stored_total < 3:
+                    actions.append("augmenting_sparse_db_with_live_search")
+                    live = await self._live_eq_search(product)
+                    if live:
+                        sources.append("serpapi")
+                        actions.append("live_augmentation_completed")
+                        # Merge live into eq_analysis so _generate_answer sees full picture
+                        eq_analysis = {
+                            **eq_analysis,
+                            "cross_brand_equivalents": (
+                                eq_analysis.get("cross_brand_equivalents", [])
+                                + live.get("cross_brand_equivalents", [])
+                            ),
+                            "partial_spec_equivalents": (
+                                eq_analysis.get("partial_spec_equivalents", [])
+                                + live.get("partial_spec_equivalents", [])
+                            ),
+                            "weak_candidates": (
+                                eq_analysis.get("weak_candidates", [])
+                                + live.get("weak_candidates", [])
+                            ),
+                        }
+                        equivalents = (
+                            eq_analysis.get("cross_brand_equivalents", [])
+                            + eq_analysis.get("partial_spec_equivalents", [])
+                        )
+                        weak_candidates = eq_analysis.get("weak_candidates", [])
             else:
-                actions.append("no_equivalent_analysis_found")
+                actions.append("no_db_analysis_triggering_live_search")
+                eq_analysis = await self._live_eq_search(product)
+                if eq_analysis:
+                    sources.append("serpapi")
+                    actions.append("live_equivalent_search_completed")
+                    equivalents = (
+                        eq_analysis.get("cross_brand_equivalents", [])
+                        + eq_analysis.get("partial_spec_equivalents", [])
+                    )
+                    weak_candidates = eq_analysis.get("weak_candidates", [])
+                    logger.info(
+                        f"Live search complete | candidates={eq_analysis['candidate_count']} | "
+                        f"cross_brand={len(eq_analysis.get('cross_brand_equivalents', []))} | "
+                        f"partial={len(eq_analysis.get('partial_spec_equivalents', []))} | "
+                        f"weak={len(eq_analysis.get('weak_candidates', []))}"
+                    )
+                else:
+                    actions.append("live_search_also_failed")
 
-        answer_data = await self._generate_answer(product, offers, price_history, intent, eq_analysis)
+        answer_data = await self._generate_answer(product, offers, price_history, intent, eq_analysis, user_message=message)
         price_analysis = self._compute_price_analysis(product, price_history)
         missing = answer_data.get("missing_information", [])
         if not price_history and "price_history" not in missing:

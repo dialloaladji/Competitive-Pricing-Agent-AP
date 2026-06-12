@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     llama_cpp_base_url: str = "https://api.groq.com/openai/v1"
     llama_cpp_model: str = "llama-3.1-8b-instant"
     llama_cpp_api_key: str = ""
-    llm_max_tokens: int = 512
+    llm_max_tokens: int = 1500
 
     tavily_api_key: str = ""
     serpapi_api_key: str = ""
