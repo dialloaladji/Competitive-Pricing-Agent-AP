@@ -1,295 +1,98 @@
-# Electrical Products Competitive Pricing & Market Intelligence
+# Competitive Pricing Agent — Electrical Products
 
-Real-time competitive pricing analysis for **electrical products only** — fast, deterministic, no LLM flakiness.
+An AI-powered pricing intelligence tool for electrical products. Ask a question in natural language, get a grounded market analysis with competitor prices, scored candidates, and expert recommendations.
 
-## Who is it for?
+---
 
-- **Marketing teams** benchmarking their electrical product catalog against competitors
-- **Pricing managers** looking for current market price points on MCBs, RCDs, contactors, switches, cables, etc.
-- **Category managers** comparing cross-brand offerings (ABB vs Schneider, Legrand, Siemens, Eaton, Hager, etc.)
+## What it does
 
-## Core use case
+Given any electrical product description, the agent:
 
-Given ONE electrical product description, find **5 cross-brand equivalents** (max 2 per brand, min 3 distinct brands) with deterministic spec matching, scored by spec quality, and priced in EUR.
+1. Searches Google Shopping in real time (SerpAPI)
+2. Scores and ranks up to 40 candidates across competing brands
+3. Returns four picks: cheapest, best score, best technical match, best overall compromise
+4. Explains why confidence is high or low (missing specs, vague listings, etc.)
+5. Remembers the conversation — follow-up questions reuse the stored analysis
 
-## Architecture
-
+**Example conversation:**
 ```
-┌──────────────────────────────────────────────────────┐
-│            FastAPI Backend (sync endpoint)            │
-│  POST /api/v1/products/analyze-equivalents            │
-│                                                        │
-│  1. Domain gate (electrical only, else HTTP 400)      │
-│  2. Deterministic spec inference (regex-based)         │
-│  3. SerpApi Google Shopping search                     │
-│  4. Deterministic normalization (brand + specs regex)  │
-│  5. Deterministic scoring (5-component weighted score) │
-│  6. Brand diversification (max 2/brand, min 3 brands)  │
-│  7. Optional LLM summarizer (3-5 sentence summary)     │
-│                                                        │
-│  Latency: ~39ms (mock) / ~5-7s (real SerpApi)         │
-└──────────────────────────────────────────────────────┘
+You   → "Find me the best price for an ABB S201-C16 1P 16A curve C 6kA"
+Agent → Analysis: 40 candidates, 6 valid matches. Best price: €2.77 (ABB), best score: €11.15 (score 0.68)
+
+You   → "Why is the confidence low?"
+Agent → Missing specs: voltage_v. Best match score 0.68 is below the 0.88 threshold for a confirmed exact match.
+
+You   → "Give me the top 3 technical matches"
+Agent → [lists 3 candidates with specs breakdown]
 ```
 
-### Services
+---
 
-| Service | Tech | Port |
+## Key capabilities
+
+| Capability | Detail |
+|---|---|
+| Live market search | Google Shopping via SerpAPI, 40 results per query |
+| Scoring | 5-component weighted score (specs, price, brand, merchant trust) |
+| Candidate picks | Cheapest / Best score / Best technical / Best analyst compromise |
+| Confidence signal | Flags low confidence when best score < 0.88 or specs are missing |
+| Brand diversity | Max 2 results per brand, min 3 distinct brands |
+| Electrical-only | Rejects non-electrical queries before any API call |
+| Conversational memory | Follow-up questions reuse stored analysis without re-searching |
+
+**Supported brands:** ABB, Schneider, Legrand, Siemens, Eaton, Hager, Chint, Hager, Bticino, and 30+ others.
+
+---
+
+## Endpoints
+
+| Method | Path | What it does |
 |---|---|---|
-| `api` | FastAPI + Uvicorn | 8001 |
-| `postgres` | PostgreSQL 16 | 5432 |
+| `POST` | `/api/v1/chat` | Conversational interface — ask anything in natural language |
+| `POST` | `/api/v1/products/analyze-equivalents` | Direct analysis — returns raw scored candidates |
+| `GET` | `/api/v1/analysis/{run_id}` | Retrieve a past analysis by ID |
+| `GET` | `/api/v1/products/{id}/analysis/latest` | Latest analysis for a tracked product |
+| `GET` | `/health` | Health check |
 
-No Celery/Redis needed — the primary endpoint is **synchronous** and finishes in seconds.
+The chat endpoint is the primary interface. The analyze-equivalents endpoint is for direct API integrations.
 
-## Pipeline (6 deterministic steps + optional LLM)
+---
 
-1. **Domain gate** — Rejects non-electrical products in <1ms (`_is_electrical`)
-2. **Spec inference** — Extracts brand, category, current, poles, curve, kA, voltage, mounting, sensitivity, differential type from description using regex
-3. **SerpApi search** — Sends description as query to Google Shopping; Tavily as fallback
-4. **Normalization** — URL dedup, price parsing, brand extraction, spec extraction from each candidate title
-5. **Scoring** — 5-component weighted score:
+## Quick start
 
-   | Component | Weight |
-   |---|---|
-   | Deterministic pre-score (brand match, similarity) | 0.25 |
-   | Spec quality (current_a, poles, curve, kA, voltage, sensitivity, differential type) | 0.35 |
-   | Price score (closer to target = better) | 0.15 |
-   | Merchant trust (Rexel/Sonepar=0.9, Amazon/Leroy Merlin=0.85, Ebay=0.6) | 0.05 |
-   | Tier-1 brand boost (ABB, Schneider, Legrand, Siemens, Eaton, Hager +0.10) | 0.10 |
-   | Base score | 0.10 |
+**Prerequisites:** Python 3.12+, Docker, a SerpAPI key, a Groq API key.
 
-6. **Brand diversification** — Greedy score-based selection, max 2 per brand, max 5 total, min 3 brands
-7. **Optional LLM summary** — Groq/Llama generates 3-5 sentence competitive landscape summary (only if ≥3 reliable candidates)
-
-## Quick Start (Local)
-
-### Prerequisites
-- Python 3.12+
-- Docker Desktop (for Postgres)
-
-### 1. Start services
 ```bash
+# 1. Start Postgres
 docker compose up -d postgres
-```
 
-### 2. Configure environment
-```bash
-cp .env.example .env
-# Edit .env with your API keys (or set MOCK_MODE=true for mock data)
-```
+# 2. Configure environment
+cp .env.example .env   # add SERPAPI_API_KEY and LLAMA_CPP_API_KEY
 
-### 3. Install dependencies & run migrations
-```bash
+# 3. Install and migrate
 pip install -r requirements.txt
 alembic upgrade head
-```
 
-### 4. Run the API
-```bash
+# 4. Run
 uvicorn api.main:app --reload --port 8001
 ```
 
-Server starts on **http://localhost:8001/docs** (Swagger UI).
+Swagger UI: **http://localhost:8001/docs**
 
-### Mock mode (no API keys needed)
+**No API keys?** Run in mock mode (returns synthetic data, no external calls):
 ```bash
 MOCK_MODE=true uvicorn api.main:app --reload --port 8001
 ```
 
-## API Endpoints
+---
 
-| Method | Path | Description |
+## Environment variables
+
+| Variable | Required | Description |
 |---|---|---|
-| `GET` | `/health` | Service health check |
-| `GET` | `/metrics-summary` | Aggregated metrics |
-| `GET` | `/api/v1/products` | List products |
-| `GET` | `/api/v1/products/{id}` | Get product |
-| `PUT` | `/api/v1/products/{id}` | Update product |
-| `DELETE` | `/api/v1/products/{id}` | Delete product |
-| `POST` | `/api/v1/chat` | Chat conversationnel — posez des questions en langage naturel |
-| **`POST`** | **`/api/v1/products/analyze-equivalents`** | **Main endpoint — synchronous analysis** |
-| `POST` | `/api/v1/products/{id}/analyze` | Trigger Celery async analysis (legacy) |
-| `GET` | `/api/v1/products/{id}/analysis/latest` | Dernière analyse complétée d'un produit |
-| `GET` | `/api/v1/analysis/{run_id}` | Analyse spécifique par son run_id |
-| `GET` | `/api/v1/products/{id}/offers` | Competitor offers |
-| `GET` | `/api/v1/products/{id}/price-history` | Price snapshots |
-| `GET` | `/api/v1/dashboard/summary` | Dashboard aggregation |
-
-## Request format
-
-```json
-{
-  "description": "Disjoncteur Legrand 16A 6kA courbe C Rail DIN",
-  "currency": "EUR"
-}
-```
-
-Optional overrides (set to `"string"` or 0 to force re-inference):
-```json
-{
-  "description": "Interrupteur différentiel 2P 40A 30mA type AC",
-  "brand": "string",
-  "category": "string",
-  "current_a": 40,
-  "poles": 2,
-  "sensitivity_ma": 30,
-  "differential_type": "AC"
-}
-```
-
-## Response format
-
-```json
-{
-  "product_id": "uuid",
-  "product_name": "Disjoncteur Legrand 16A 6kA courbe C Rail DIN",
-  "candidate_count": 40,
-  "valid_match_count": 15,
-  "cross_brand_count": 5,
-  "weak_candidate_count": 0,
-  "best_match_price": 8.50,
-  "cross_brand_equivalents": [
-    {
-      "title": "Schneider Easy9 1P 16A C 6kA",
-      "brand": "Schneider Electric",
-      "price": 8.50,
-      "score": 0.82,
-      "spec_quality": 0.85,
-      "spec_match": "exact_spec_equivalent",
-      "specs": {
-        "current_a": 16, "poles": 1, "curve": "C",
-        "breaking_capacity_ka": 6.0, "mounting": "DIN rail"
-      }
-    }
-  ],
-  "partial_spec_equivalents": [
-    {
-      "title": "Legrand 412020 2P 40A 30mA type A",
-      "brand": "Legrand",
-      "price": 52.00,
-      "score": 0.55,
-      "spec_quality": 0.35,
-      "spec_match": "functional_equivalent",
-      "specs": {
-        "current_a": 40, "poles": 2, "sensitivity_ma": 30,
-        "differential_type": "A", "mounting": "DIN rail"
-      }
-    }
-  ],
-  "same_brand_listings": [],
-  "weak_candidates": [],
-  "inferred_product": {
-    "name": "Disjoncteur Legrand 16A 6kA courbe C Rail DIN",
-    "category": "miniature circuit breaker",
-    "brand": "Legrand",
-    "specs": {
-      "current_a": 16, "curve": "C",
-      "breaking_capacity_ka": 6.0, "mounting": "DIN rail"
-    }
-  },
-  "recommendation": "Competitive landscape summary...",
-  "price_confidence": 0.85
-}
-```
-
-## Domain validation
-
-The API is **restricted to electrical products only**. Non-electrical descriptions are rejected with **HTTP 400** before any API call.
-
-**Accepted:** circuit breakers, RCDs, contactors, switches, cables, electrical panels, EV chargers, transformers, relays, fuses, sockets
-
-**Rejected:** headphones, food, clothing, furniture, toys, automotive parts
-
-## Supported electrical brands
-
-**Tier 1 (boosted +0.10):** ABB, Schneider, Legrand, Siemens, Eaton, Hager
-
-**Tier 2:** Chint, Noark, Phoenix Contact, Wago, Finder, Lovato, Mitsubishi, Bticino, Gewiss
-
-**Tier 3 (regional/heritage):** Crouzet, Klockner Moeller, Telemecanique, Merlin Gerin, Square D, Carlo Gavazzi, HENSEL, Spelsberg, Rittal, Weidmuller
-
-**Switches & wiring:** Gira, Jung, Berker, Feller, Merten, Siedle, Bals, Walther
-
-**Cable & EV:** Nexans, Prysmian, Lapp, Helukabel, Wallbox
-
-## Environment Variables
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `DATABASE_URL` | ✅ | — | PostgreSQL async URL |
-| `LLAMA_CPP_API_KEY` | — | — | Groq API key (for summarizer) |
-| `LLAMA_CPP_BASE_URL` | — | `https://api.groq.com/openai/v1` | LLM endpoint |
-| `LLAMA_CPP_MODEL` | — | `llama-3.1-8b-instant` | LLM model |
-| `SERPAPI_API_KEY` | ✅ | — | SerpApi Google Shopping |
-| `TAVILY_API_KEY` | — | — | Tavily fallback web search |
-| `MOCK_MODE` | — | `false` | Run without API keys |
-| `LLM_PROVIDER` | — | `groq` | LLM backend |
-| `LLM_MAX_TOKENS` | — | `512` | Max LLM response tokens |
-
-## Chat API
-
-`POST /api/v1/chat` — posez des questions en langage naturel sur vos produits.
-
-### Request
-```json
-{
-  "message": "Compare this Schneider product with ABB and Legrand equivalents.",
-  "product_id": "uuid-optional",
-  "conversation_id": "uuid-optional"
-}
-```
-
-### Response structure
-```json
-{
-  "answer": "Expert analysis text...",
-  "intent": "product_comparison",
-  "product": { "id": "...", "name": "...", "brand": "...", "category": "..." },
-  "offers": [{"price": 8.50, "merchant": "Rexel", "in_stock": true}],
-  "price_analysis": {
-    "has_history": true,
-    "min_price": 7.80,
-    "max_price": 12.50,
-    "median_price": 8.50,
-    "trend": "stable"
-  },
-  "market_analysis": {
-    "observed_facts": ["3 offers found"],
-    "recommendations": ["Consider Rexel for best price"]
-  },
-  "confidence": "high",
-  "sources_used": ["database", "offers"],
-  "missing_information": ["price_history"]
-}
-```
-
-### Comportement
-- **Intent classification** automatique via LLM (ou `_mock_intent` en mock mode)
-- **Recherche base de données** d'abord avant tout appel externe
-- Si produit trouvé → réponse experte avec offres, historique, analyse
-- Si produit non trouvé → déclenchement automatique du pipeline `analyze-equivalents`
-- Anti-hallucination : ne jamais inventer de prix, stock, ou références
-
-### Exemples de questions supportées
-- "Compare this Schneider product with ABB equivalents."
-- "Show me the price evolution over the last 3 months."
-- "Which marketplace has the best price?"
-- "Find equivalent products for this reference."
-- "Do we have stock issues on this product?"
-
-## Mock Mode
-
-Set `MOCK_MODE=true` to run the full pipeline without any API keys. Returns 5 mock SerpApi results (Schneider €8.50, Legrand €7.80, Hager €9.20, Siemens €12.50, ABB €7.95) with mock LLM summary. Latency: ~39ms.
-
-## Test coverage
-
-111 unit tests covering:
-- Domain detection (electrical vs non-electrical)
-- Spec inference (current_a, poles, curve, kA, voltage, mounting, sensitivity_ma, differential_type, brand)
-- RCD-specific extraction (30mA, type AC/A/F, 2P from "2x40A")
-- Spec quality scoring with all weights and penalties
-- Differential type matching penalty (-0.20 for mismatch)
-- Brand diversification (max 2/brand, min 3 brands)
-- Cross-brand bonus, same-brand detection
-- Vague title detection
-- Merchant trust scoring
-- Output capping (max 5, max 2 per brand)
+| `DATABASE_URL` | Yes | PostgreSQL async URL |
+| `SERPAPI_API_KEY` | Yes | Google Shopping search |
+| `LLAMA_CPP_API_KEY` | Yes | Groq API key (LLM answers) |
+| `MOCK_MODE` | No | `true` to run without API keys |
+| `LLAMA_CPP_BASE_URL` | No | LLM endpoint (default: Groq) |
+| `LLAMA_CPP_MODEL` | No | Model (default: llama-3.1-8b-instant) |
