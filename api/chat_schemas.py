@@ -38,9 +38,14 @@ class ChatResponse(BaseModel):
     intent: str = "general_question"
     product: ProductBrief = Field(default_factory=ProductBrief)
     products_found: list[ProductBrief] = []
+    # Confirmed cross-brand equivalents (score >= threshold, not vague)
     equivalents: list[dict] = []
+    # Partial-spec candidates (below confirmation threshold but not vague)
+    partial_candidates: list[dict] = []
     weak_candidates: list[dict] = []
     offers: list[dict] = []
+    # How many of `equivalents` are confirmed matches (valid_match_count)
+    confirmed_equivalents_count: int = 0
     price_analysis: PriceAnalysis = Field(default_factory=PriceAnalysis)
     market_analysis: MarketAnalysis = Field(default_factory=MarketAnalysis)
     confidence: str = "low"

@@ -17,6 +17,7 @@ from api.chat_schemas import (
 )
 from api.models import Product, Offer, PriceSnapshot, AnalysisRun, AnalysisStatus, ChatConversation, ChatMessage
 from api.llm_client import get_llm_client, search_serpapi
+from api.analysis_service import run_equivalent_analysis_from_text, compact_analysis_context
 from worker.tasks import normalize_candidates, score_candidates
 from worker.scoring import (
     _infer_product_attributes, _extract_brand_from_title,
@@ -25,7 +26,7 @@ from worker.scoring import (
 
 logger = logging.getLogger("api.chat")
 
-# Intents that warrant fetching equivalent analysis results
+# Intents that warrant fetching equivalent analysis results from DB
 ANALYSIS_INTENTS = {
     "equivalent_products_search",
     "product_comparison",
@@ -33,6 +34,79 @@ ANALYSIS_INTENTS = {
     "price_history_analysis",
     "market_analysis",
 }
+
+# Intents that trigger a fresh live analysis instead of a DB product lookup.
+# For these intents the orchestrator runs run_equivalent_analysis_from_text()
+# directly and stores the full result in message metadata.
+FRESH_ANALYSIS_INTENTS = {
+    "equivalent_products_search",
+    "product_lookup",
+    "product_comparison",
+    "price_analysis",
+    "market_analysis",
+    "stock_analysis",
+}
+
+# Keywords that signal the user is asking about a NEW product (not following up).
+# Keep this list focused on unambiguous new-search signals only.
+# "analyse"/"analyser" are NOT here — they appear in follow-up analysis requests too.
+_NEW_QUERY_SIGNALS = [
+    # French action verbs for a fresh search
+    "trouve", "recherche", "cherche",
+    "nouvelle recherche", "cherche encore", "cherche un autre",
+    "nouveau produit", "autre produit",
+    # Electrical product categories (user names a device = new query)
+    "disjoncteur", "interrupteur", "contacteur", "câble", "cable",
+    "relais", "variateur", "onduleur", "fusible",
+    # Major brands (user names a brand = new query, unless overridden by followup signals)
+    "legrand", "schneider", "abb ", " abb", "hager", "siemens", "eaton",
+    # English
+    "find me", "search for", "look for", "new search", "another product",
+]
+
+# Keywords that OVERRIDE _is_new_product_query and confirm this is a follow-up.
+# These are unambiguous references to prior retrieved data.
+_ANALYTICAL_FOLLOWUP_SIGNALS = [
+    # Direct references to previous results
+    "ce résultat", "ces résultats", "ces candidats", "ces produits", "ce candidat",
+    "dernier résultat", "dernière analyse", "dernier", "derniers résultats",
+    "les weak", "les partiels", "les résultats", "ce que tu as trouvé",
+    "ce que tu as analysé", "les produits trouvés", "les candidats trouvés",
+    # Comparative / choice requests (about previously retrieved candidates)
+    "lequel", "laquelle", "lesquels",
+    "suggères", "suggère", "recommandes", "recommande",
+    "sépare", "séparer", "classe", "classer", "trier", "trie",
+    "moins cher", "plus cher", "meilleur score", "meilleur rapport",
+    "meilleur compromis", "market analyst", "analyst",
+    # Explicit requests to analyse existing data (not run a new search)
+    "résumé compact", "analyse détaillée", "analyse le résultat", "analyse les résultats",
+    "analyser les résultats", "analyser le résultat", "fais une analyse",
+    "analyse approfondie", "compact", "utilise seulement", "utilise le résumé",
+    "du dernier résultat", "des résultats précédents", "en utilisant",
+    # English equivalents
+    "analyze the result", "analyse the result", "last result", "previous result",
+    "which one", "compare them", "cheapest", "best score",
+    # Explanation / clarification requests (about the current analysis)
+    "pourquoi", "pour quelle raison", "comment ça", "comment se fait",
+    "explique", "expliquer", "explication",
+    "qu'est-ce que", "qu'est ce que", "c'est quoi", "c est quoi",
+    "aucun match", "aucun résultat", "aucun équivalent", "0 match", "zéro match",
+    "mais pourquoi", "et pourquoi", "alors pourquoi",
+    "ça veut dire quoi", "que veut dire", "que signifie",
+    "donne-moi plus", "dis-moi plus", "encore plus", "plus de détail",
+]
+
+
+def _is_new_product_query(message: str) -> bool:
+    """Return True when the message looks like a new product search rather than a follow-up."""
+    msg_lower = message.lower()
+    return any(sig in msg_lower for sig in _NEW_QUERY_SIGNALS)
+
+
+def _is_analytical_followup(message: str) -> bool:
+    """Return True when the message is clearly a follow-up on previously retrieved analysis."""
+    msg_lower = message.lower()
+    return any(sig in msg_lower for sig in _ANALYTICAL_FOLLOWUP_SIGNALS)
 
 DEEP_FOLLOWUP_KEYWORDS = [
     # English
@@ -60,13 +134,138 @@ def _is_deep_followup(message: str) -> bool:
 
 
 def _extract_json(text: str) -> dict:
-    """Parse JSON from LLM response, stripping markdown fences if present."""
+    """Parse JSON from LLM response.
+
+    Handles three common formats:
+    - Raw JSON
+    - ```json ... ``` fences
+    - Prose text with an embedded { ... } block (LLM adds explanation before/after)
+    """
     text = text.strip()
+    # Strip markdown fences
     if text.startswith("```"):
         lines = text.splitlines()
         inner = "\n".join(lines[1:-1]) if lines[-1].strip() == "```" else "\n".join(lines[1:])
         text = inner.strip()
-    return json.loads(text)
+    # Try direct parse first (fastest path)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Scan for embedded { ... } block — handles "Here is the analysis: {...}"
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        for i, ch in enumerate(text[start:], start=start):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except json.JSONDecodeError:
+                        break
+    raise ValueError(f"No valid JSON found in LLM response (first 200 chars): {text[:200]!r}")
+
+
+def _rank_all_candidates(analysis: dict) -> list[dict]:
+    """
+    Return all candidates from an analysis dict sorted by:
+      1. bucket (reliable > partial > weak)
+      2. score descending
+      3. price ascending (tie-break)
+    Each entry is annotated with rank, bucket, and a spec_warning flag.
+    """
+    buckets = [
+        ("reliable", analysis.get("cross_brand_equivalents", [])),
+        ("partial",  analysis.get("partial_spec_equivalents", [])),
+        ("weak",     analysis.get("weak_candidates", [])),
+    ]
+    ranked: list[dict] = []
+    for group_idx, (bucket, candidates) in enumerate(buckets):
+        for c in candidates:
+            ranked.append({
+                "_group": group_idx,
+                "bucket": bucket,
+                "title": c.get("title", ""),
+                "price": c.get("price"),
+                "merchant": c.get("merchant", ""),
+                "score": c.get("score", 0),
+                "spec_quality": c.get("spec_quality", 0),
+                "is_vague": c.get("is_vague", False),
+                "classification": c.get("classification", ""),
+                "brand": c.get("brand"),
+                "url": c.get("url", ""),
+            })
+
+    ranked.sort(key=lambda x: (
+        x["_group"],
+        -(x["score"] or 0),
+        (x["price"] or float("inf")),
+    ))
+    result = []
+    for i, c in enumerate(ranked):
+        has_incomplete = c.get("is_vague") or (c.get("spec_quality") or 0) < 0.25
+        result.append({
+            "rank": i + 1,
+            **{k: v for k, v in c.items() if k != "_group"},
+            "spec_warning": "incomplete specs — verify before purchase" if has_incomplete else "",
+        })
+    return result
+
+
+def _scored_to_analysis(scored: list, raw_count: int = 0) -> dict:
+    """Convert a flat list of scored candidates into an eq_analysis-shaped dict."""
+    cross_brand: list[dict] = []
+    partial: list[dict] = []
+    weak: list[dict] = []
+    for s in scored:
+        score = s.get("score", 0)
+        is_same_brand = s.get("is_same_brand", False)
+        is_vague = s.get("is_vague", False)
+        spec_quality = s.get("spec_quality", 0)
+        entry = {
+            "title": s.get("title", ""),
+            "price": s.get("price", 0),
+            "currency": s.get("currency", "EUR"),
+            "merchant": s.get("merchant", ""),
+            "url": s.get("url", ""),
+            "score": score,
+            "spec_quality": spec_quality,
+            "classification": s.get("classification", "functional_equivalent"),
+            "is_vague": is_vague,
+            "brand": s.get("brand"),
+            "is_same_brand": is_same_brand,
+        }
+        if is_same_brand:
+            pass  # exact match — not an equivalent
+        elif score >= EXACT_MATCH_SCORE_THRESHOLD and not is_vague:
+            cross_brand.append(entry)
+        elif spec_quality >= 0.25 and not is_vague:
+            partial.append(entry)
+        else:
+            weak.append(entry)
+
+    best_score = max((s.get("score", 0) for s in scored), default=None)
+    valid_count = len(cross_brand)
+    return {
+        "run_id": "inline_search",
+        "candidate_count": raw_count or len(scored),
+        "valid_match_count": valid_count,
+        "cross_brand_equivalents": cross_brand,
+        "partial_spec_equivalents": partial,
+        "weak_candidates": weak,
+        "best_match_score": best_score,
+        "price_confidence": best_score,
+        "recommendation": None,
+    }
+
+
+def _analysis_needs_low_confidence(analysis: dict) -> bool:
+    score = analysis.get("best_match_score") or 0
+    valid = analysis.get("valid_match_count", 0)
+    return valid == 0 or score < LOW_CONFIDENCE_SCORE_THRESHOLD
 
 
 def _stream_extract_answer(state: dict, new_text: str) -> str:
@@ -112,6 +311,9 @@ def _stream_extract_answer(state: dict, new_text: str) -> str:
 # Minimum score threshold for classifying an offer as an exact source-product match
 EXACT_MATCH_SCORE_THRESHOLD = 0.88
 
+# Below this score, confidence is always "low" and recommendations must be cautious
+LOW_CONFIDENCE_SCORE_THRESHOLD = 0.70
+
 SYSTEM_INTENT_PROMPT = """Classify the user's question about electrical products into exactly one intent.
 
 Possible intents:
@@ -153,16 +355,22 @@ CONVERSATION MEMORY RULES:
 - If a fact is only in conversation memory, say "according to our conversation" or "you mentioned".
 - If uncertain, state clearly that the information is not verified.
 
+STRICT GROUNDING RULES (non-negotiable):
+- ONLY list products that exist in grounded_candidates, reliable_candidates, partial_candidates, or weak_candidates_sample in the provided context.
+- NEVER invent product titles, prices, merchants, references, or specs.
+- If the user asks for N products but only M exist in the context (M < N), return M and add to the answer: "I only have M candidates in the retrieved analysis. I will not invent additional products."
+- confidence MUST be "low" if context shows best_match_score < 0.70 or valid_match_count = 0.
+- If valid_match_count = 0: do NOT recommend a specific product. Instead recommend: (1) refine specs — poles, curve, breaking capacity, reference number; (2) verify merchant pages directly; (3) run a new search with explicit specs.
+- When asked "which is best?", always answer with FOUR distinct sections from candidate_recommendations: (a) cheapest_candidate — lowest price; (b) best_score_candidate — highest score; (c) best_technical_candidate — best spec match (current_a, curve, poles, breaking_capacity_ka); (d) analyst_recommendation (best_market_analyst_choice) — overall best compromise. If valid_match_count=0, say "No confirmed match. Best partial candidate: X — verify specs before purchase." in section (d).
+
 DEEP ANALYSIS RULES (apply when user asks to go deeper, list candidates, compare, or re-analyse):
 - NEVER repeat the same summary you already gave. If the user pushes for more, go further.
-- Enumerate ALL candidate buckets present in context: reliable_candidates, partial_candidates, weak_candidates_sample.
+- Enumerate ALL candidate buckets present in context: reliable_candidates, partial_candidates, weak_candidates_sample (or grounded_candidates if present).
 - For EACH candidate write one line inside `answer` using the actual data values: "• [bucket] <actual product title from data, max 60 chars> — €<actual price> — score=<actual score> — <specific reason why confidence is limited>".
 - Do NOT end `answer` with a colon or a heading sentence that promises a list but delivers nothing.
 - Put ALL enumeration inline inside the `answer` string — not in observed_facts.
 - Explain WHY a score is low: vague specs, wrong brand, missing technical data, etc.
-- Give an opinionated recommendation even under uncertainty — just be explicit about confidence.
-- Never refuse to discuss weak/partial candidates — label them clearly and let the user decide.
-- If the user asks "which one is best", pick one and justify it, even if confidence is limited.
+- If the user asks "which one is best", provide the four sections: cheapest, best score, best technical, analyst recommendation.
 
 Output JSON with these keys:
 - answer: str — natural language expert answer (as long as needed to fully enumerate candidates; minimum 5 sentences when candidates are available)
@@ -198,16 +406,22 @@ CONVERSATION MEMORY RULES:
 - Prices, stock, references must come from database context, not from memory.
 - If uncertain, state clearly that the information is not verified.
 
+STRICT GROUNDING RULES (non-negotiable):
+- ONLY list products that exist in top_candidates_sample or candidate_recommendations in the provided context.
+- NEVER invent product titles, prices, merchants, references, or specs.
+- The context contains a sample of candidates. candidate_count tells you the total found. If asked to list all N candidates and only M are in the context, list the M available and state clearly: "J'ai accès à M candidats dans le contexte (sur N trouvés au total)."
+- confidence MUST be "low" if best_match_score < 0.70 or valid_match_count = 0.
+- If valid_match_count = 0: do NOT recommend a specific product. Recommend: (1) refine specs; (2) verify pages; (3) run a new search with explicit specs.
+- When asked "which is best?", answer with four sections from candidate_recommendations: cheapest_candidate, best_score_candidate, best_technical_candidate, analyst_recommendation (best_market_analyst_choice).
+
 DEEP ANALYSIS RULES (apply when user asks to go deeper, list candidates, compare, or re-analyse):
 - NEVER repeat the same summary you already gave. If the user pushes for more, go further.
-- Enumerate ALL candidate buckets present in context: reliable_candidates, partial_candidates, weak_candidates_sample.
+- Enumerate ALL candidate buckets present in context: reliable_candidates, partial_candidates, weak_candidates_sample (or grounded_candidates if present).
 - For EACH candidate write one line inside `answer` using the actual data values: "• [bucket] <actual product title from data, max 60 chars> — €<actual price> — score=<actual score> — <specific reason why confidence is limited>".
 - Do NOT end `answer` with a colon or a heading sentence that promises a list but delivers nothing.
 - Put ALL enumeration inline inside the `answer` string — not in observed_facts.
 - Explain WHY a score is low: vague specs, wrong brand, missing technical data, etc.
-- Give an opinionated recommendation even under uncertainty — just be explicit about confidence.
-- Never refuse to discuss weak/partial candidates — label them clearly and let the user decide.
-- If the user asks "which one is best", pick one and justify it, even if confidence is limited.
+- If the user asks "which one is best", provide three sections: cheapest_candidate, best_score_candidate, analyst_recommendation.
 
 Output JSON with these keys:
 - answer: str — natural language analysis (as long as needed to fully enumerate candidates; minimum 5 sentences when candidates are available)
@@ -291,6 +505,138 @@ class ChatOrchestrator:
         sources.append("intent_classifier")
         actions.append(f"intent_classified_as_{intent}")
 
+        # ── Fresh analysis path ──────────────────────────────────────────
+        # Trigger when:
+        #   a) intent explicitly requests analysis (FRESH_ANALYSIS_INTENTS), OR
+        #   b) a prior fresh analysis exists in this conversation and the message
+        #      is a follow-up: not a new-product query, OR explicitly references
+        #      the prior analysis results (_is_analytical_followup).
+        # Bypasses DB product lookup for all covered cases.
+        stored_fresh = conv_context.get("fresh_equivalent_analysis")
+        is_followup = bool(stored_fresh) and (
+            not _is_new_product_query(message) or _is_analytical_followup(message)
+        )
+        if intent in FRESH_ANALYSIS_INTENTS or is_followup:
+
+            if is_followup:
+                compact = compact_analysis_context(stored_fresh, message)
+                slim = self._slim_compact_for_llm(compact)
+                answer_data = await self._answer_from_compact_context(
+                    message, slim, intent, is_followup=True,
+                )
+                actions.append("fresh_analysis_followup_from_metadata")
+                sources.append("conversation_metadata")
+                full_result_to_save = stored_fresh
+            else:
+                full_result = await run_equivalent_analysis_from_text(
+                    message, self.db, persist=True, llm=self.llm,
+                )
+                compact = compact_analysis_context(full_result, message)
+                slim = self._slim_compact_for_llm(compact)
+                answer_data = await self._answer_from_compact_context(
+                    message, slim, intent, is_followup=False,
+                )
+                actions.append("fresh_equivalent_analysis_triggered")
+                sources.append("serpapi")
+                full_result_to_save = full_result
+
+            # Confidence floor
+            best_score = full_result_to_save.get("best_match_score")
+            valid = full_result_to_save.get("valid_match_count", 0)
+            raw_confidence = answer_data.get("confidence", "medium")
+            if valid == 0 or (best_score is not None and best_score < LOW_CONFIDENCE_SCORE_THRESHOLD):
+                raw_confidence = "low"
+
+            product_id_fresh = full_result_to_save.get("product_id")
+            product_name_fresh = full_result_to_save.get("product_name")
+            # Preserve explicitly-provided product_id over the freshly-created one
+            effective_product_id = product_id or product_id_fresh
+
+            # Load exact offers from the known product when a product_id is available
+            _offers_source = product_id or ((stored_fresh or {}).get("product_id") if is_followup else None)
+            _resp_offers: list[dict] = []
+            if _offers_source and _offers_source != "in_memory":
+                try:
+                    _resp_offers = await self._get_offers(_offers_source)
+                except Exception:
+                    _resp_offers = []
+
+            # Use pre-computed recommendations from compact context
+            _recs = compact.get("candidate_recommendations", {})
+            _confirmed = _recs.get("confirmed_equivalents", compact.get("cross_brand_equivalents", []))
+            _partial = _recs.get("partial_candidates", compact.get("partial_spec_equivalents", []))
+            _confirmed_count = _recs.get("confirmed_equivalents_count", valid)
+
+            resp = ChatResponse(
+                answer=answer_data.get("answer", ""),
+                intent=intent,
+                equivalents=_confirmed,
+                partial_candidates=_partial,
+                confirmed_equivalents_count=_confirmed_count,
+                offers=_resp_offers,
+                weak_candidates=compact.get("weak_candidates", []),
+                market_analysis=MarketAnalysis(
+                    observed_facts=answer_data.get("observed_facts", []),
+                    hypotheses=answer_data.get("hypotheses", []),
+                    risks=answer_data.get("risks", []),
+                    recommendations=answer_data.get("recommendations", []),
+                ),
+                confidence=raw_confidence,
+                sources_used=list(set(sources)),
+                actions_triggered=actions,
+                missing_information=answer_data.get("missing_information", []),
+            )
+            if effective_product_id and effective_product_id != "in_memory":
+                resp.product_id = effective_product_id
+                resp.product = ProductBrief(
+                    id=effective_product_id,
+                    name=product_name_fresh,
+                    brand=(full_result_to_save.get("inferred_product") or {}).get("brand"),
+                    category=(full_result_to_save.get("inferred_product") or {}).get("category"),
+                )
+
+            saved_for_metadata = self._cap_fresh_for_metadata(full_result_to_save)
+            saved_for_metadata["product_id"] = effective_product_id
+            def _cap(lst: list, n: int = 30) -> list:
+                return lst[:n] if lst else []
+            assistant_metadata = {
+                "type": "fresh_equivalent_analysis",
+                "product_id": effective_product_id,
+                "product_name": product_name_fresh,
+                "offers": _resp_offers[:10],
+                "fresh_equivalent_analysis": saved_for_metadata,
+                "compact_analysis_context": compact,
+                "sources_used": resp.sources_used,
+                "actions_triggered": actions,
+                # Backward-compat: get_conversation_context and legacy tests read analysis_run
+                "analysis_run": {
+                    "run_id": full_result_to_save.get("run_id"),
+                    "candidate_count": full_result_to_save.get("candidate_count", 0),
+                    "valid_match_count": full_result_to_save.get("valid_match_count", 0),
+                    "cross_brand_equivalents": _cap(full_result_to_save.get("cross_brand_equivalents", [])),
+                    "partial_spec_equivalents": _cap(full_result_to_save.get("partial_spec_equivalents", [])),
+                    "weak_candidates": _cap(full_result_to_save.get("weak_candidates", [])),
+                    "best_match_score": full_result_to_save.get("best_match_score"),
+                    "price_confidence": full_result_to_save.get("price_confidence"),
+                    "recommendation": full_result_to_save.get("recommendation"),
+                },
+            }
+            assistant_msg = await save_message(
+                self.db, conversation_id, "assistant", resp.answer, metadata=assistant_metadata,
+            )
+            await maybe_update_conversation_summary(self.db, conversation_id, self.llm)
+            resp.conversation_id = conversation_id
+            resp.message_id = str(assistant_msg.id)
+            resp.intent = intent
+            latency_ms = int((time.time() - start_time) * 1000)
+            logger.info(
+                f"Chat (fresh) | intent={intent} | followup={is_followup} | "
+                f"candidates={full_result_to_save.get('candidate_count', 0)} | "
+                f"latency_ms={latency_ms} | confidence={resp.confidence}"
+            )
+            return resp
+        # ────────────────────────────────────────────────────────────────
+
         product = None
         if product_id:
             product = await self._get_product_by_id(product_id)
@@ -323,6 +669,34 @@ class ChatOrchestrator:
             )
             resp.product_id = str(product.id)
 
+        # Retrieve the eq_analysis stored by _handle_product_found / _handle_no_product
+        saved_eq = getattr(self, "_last_eq_analysis", None)
+
+        # Override confidence floor from analysis data (LLM can't be trusted to enforce it)
+        if saved_eq and _analysis_needs_low_confidence(saved_eq):
+            resp.confidence = "low"
+        elif self._conversation_context.get("analysis_run") and _analysis_needs_low_confidence(
+            self._conversation_context["analysis_run"]
+        ):
+            resp.confidence = "low"
+
+        def _cap(lst: list, n: int = 30) -> list:
+            return lst[:n] if lst else []
+
+        analysis_run_to_save = None
+        if saved_eq:
+            analysis_run_to_save = {
+                "run_id": saved_eq.get("run_id"),
+                "candidate_count": saved_eq.get("candidate_count", 0),
+                "valid_match_count": saved_eq.get("valid_match_count", 0),
+                "cross_brand_equivalents": _cap(saved_eq.get("cross_brand_equivalents", [])),
+                "partial_spec_equivalents": _cap(saved_eq.get("partial_spec_equivalents", [])),
+                "weak_candidates": _cap(saved_eq.get("weak_candidates", [])),
+                "best_match_score": saved_eq.get("best_match_score"),
+                "price_confidence": saved_eq.get("price_confidence"),
+                "recommendation": saved_eq.get("recommendation"),
+            }
+
         assistant_metadata = {
             "product_id": str(product.id) if product else None,
             "product_name": product.name if product else None,
@@ -332,6 +706,7 @@ class ChatOrchestrator:
             "price_analysis": resp.price_analysis.model_dump() if resp.price_analysis else None,
             "sources_used": resp.sources_used,
             "actions_triggered": actions,
+            "analysis_run": analysis_run_to_save,
         }
         assistant_msg = await save_message(
             self.db, conversation_id, "assistant", resp.answer, metadata=assistant_metadata
@@ -387,6 +762,132 @@ class ChatOrchestrator:
         yield thinking(f"Intention : {intent} ({intent_conf:.0%})", "intent_done")
         sources.append("intent_classifier")
         actions.append(f"intent_classified_as_{intent}")
+
+        # ── Fresh analysis path (streaming) ──────────────────────────────
+        stored_fresh = conv_context.get("fresh_equivalent_analysis")
+        is_followup = bool(stored_fresh) and (
+            not _is_new_product_query(message) or _is_analytical_followup(message)
+        )
+        if intent in FRESH_ANALYSIS_INTENTS or is_followup:
+
+            if is_followup:
+                yield thinking("Chargement de l'analyse précédente…", "analysis_reload")
+                compact = compact_analysis_context(stored_fresh, message)
+                actions.append("fresh_analysis_followup_from_metadata")
+                sources.append("conversation_metadata")
+                full_result_to_save = stored_fresh
+            else:
+                yield thinking("Analyse live en cours…", "live_analysis")
+                full_result = await run_equivalent_analysis_from_text(
+                    message, self.db, persist=True, llm=self.llm,
+                )
+                n_cand = full_result.get("candidate_count", 0)
+                yield thinking(f"{n_cand} candidats trouvés — génération de la réponse…", "analysis_done")
+                compact = compact_analysis_context(full_result, message)
+                actions.append("fresh_equivalent_analysis_triggered")
+                sources.append("serpapi")
+                full_result_to_save = full_result
+
+            yield thinking("Génération de la réponse…", "generating")
+            # Use the non-streaming LLM path with a slim context — this is more reliable
+            # than accumulating streaming tokens and parsing JSON afterwards.
+            # Simulate token streaming after receiving the complete answer.
+            slim = self._slim_compact_for_llm(compact)
+            answer_data = await self._answer_from_compact_context(
+                message, slim, intent, is_followup=is_followup,
+            )
+            yield {"type": "token", "text": answer_data["answer"]}
+
+            best_score = full_result_to_save.get("best_match_score")
+            valid = full_result_to_save.get("valid_match_count", 0)
+            raw_confidence = answer_data.get("confidence", "medium")
+            if valid == 0 or (best_score is not None and best_score < LOW_CONFIDENCE_SCORE_THRESHOLD):
+                raw_confidence = "low"
+
+            product_id_fresh = full_result_to_save.get("product_id")
+            product_name_fresh = full_result_to_save.get("product_name")
+            # Preserve explicitly-provided product_id over the freshly-created one
+            effective_product_id = product_id or product_id_fresh
+
+            # Load exact offers from the known product when a product_id is available
+            _offers_source = product_id or ((stored_fresh or {}).get("product_id") if is_followup else None)
+            _resp_offers: list[dict] = []
+            if _offers_source and _offers_source != "in_memory":
+                try:
+                    _resp_offers = await self._get_offers(_offers_source)
+                except Exception:
+                    _resp_offers = []
+
+            # Use pre-computed recommendations from compact context
+            _recs = compact.get("candidate_recommendations", {})
+            _confirmed = _recs.get("confirmed_equivalents", compact.get("cross_brand_equivalents", []))
+            _partial = _recs.get("partial_candidates", compact.get("partial_spec_equivalents", []))
+            _confirmed_count = _recs.get("confirmed_equivalents_count", valid)
+
+            resp = ChatResponse(
+                answer=answer_data.get("answer", ""),
+                intent=intent,
+                equivalents=_confirmed,
+                partial_candidates=_partial,
+                confirmed_equivalents_count=_confirmed_count,
+                offers=_resp_offers,
+                weak_candidates=compact.get("weak_candidates", []),
+                market_analysis=MarketAnalysis(
+                    observed_facts=answer_data.get("observed_facts", []),
+                    hypotheses=answer_data.get("hypotheses", []),
+                    risks=answer_data.get("risks", []),
+                    recommendations=answer_data.get("recommendations", []),
+                ),
+                confidence=raw_confidence,
+                sources_used=list(set(sources)),
+                actions_triggered=actions,
+                missing_information=answer_data.get("missing_information", []),
+            )
+            if effective_product_id and effective_product_id != "in_memory":
+                resp.product_id = effective_product_id
+                resp.product = ProductBrief(
+                    id=effective_product_id,
+                    name=product_name_fresh,
+                    brand=(full_result_to_save.get("inferred_product") or {}).get("brand"),
+                    category=(full_result_to_save.get("inferred_product") or {}).get("category"),
+                )
+
+            saved_for_metadata = self._cap_fresh_for_metadata(full_result_to_save)
+            saved_for_metadata["product_id"] = effective_product_id
+            def _cap(lst: list, n: int = 30) -> list:
+                return lst[:n] if lst else []
+            assistant_metadata = {
+                "type": "fresh_equivalent_analysis",
+                "product_id": effective_product_id,
+                "product_name": product_name_fresh,
+                "offers": _resp_offers[:10],
+                "fresh_equivalent_analysis": saved_for_metadata,
+                "compact_analysis_context": compact,
+                "sources_used": resp.sources_used,
+                "actions_triggered": actions,
+                # Backward-compat: get_conversation_context and legacy tests read analysis_run
+                "analysis_run": {
+                    "run_id": full_result_to_save.get("run_id"),
+                    "candidate_count": full_result_to_save.get("candidate_count", 0),
+                    "valid_match_count": full_result_to_save.get("valid_match_count", 0),
+                    "cross_brand_equivalents": _cap(full_result_to_save.get("cross_brand_equivalents", [])),
+                    "partial_spec_equivalents": _cap(full_result_to_save.get("partial_spec_equivalents", [])),
+                    "weak_candidates": _cap(full_result_to_save.get("weak_candidates", [])),
+                    "best_match_score": full_result_to_save.get("best_match_score"),
+                    "price_confidence": full_result_to_save.get("price_confidence"),
+                    "recommendation": full_result_to_save.get("recommendation"),
+                },
+            }
+            assistant_msg = await save_message(
+                self.db, conversation_id, "assistant", resp.answer, metadata=assistant_metadata,
+            )
+            await maybe_update_conversation_summary(self.db, conversation_id, self.llm)
+            resp.conversation_id = conversation_id
+            resp.message_id = str(assistant_msg.id)
+            resp.intent = intent
+            yield {"type": "done", "data": resp.model_dump()}
+            return
+        # ────────────────────────────────────────────────────────────────
 
         yield thinking("Recherche du produit…", "product")
         product = None
@@ -491,34 +992,12 @@ class ChatOrchestrator:
             yield thinking("Génération de la réponse…", "generating")
             price_analysis = self._compute_price_analysis(product, price_history)
 
-            if self.is_mock:
-                result = self._mock_answer(product, offers, price_analysis, intent, eq_analysis)
-                yield {"type": "token", "text": result["answer"]}
-                answer_data = result
-            else:
-                product_context = self._build_product_context(
-                    product, offers, price_history, price_analysis, intent, eq_analysis, message
-                )
-                context_messages = build_chat_context(
-                    SYSTEM_ANSWER_PROMPT,
-                    self._conversation_summary,
-                    self._recent_messages,
-                    product_context,
-                    self._build_current_msg(message, intent, product.name),
-                )
-                full_content = ""
-                stream_state = {"buf": "", "in_answer": False, "done": False, "esc": False}
-                try:
-                    async for token in self.llm.stream_chat_messages(context_messages):
-                        full_content += token
-                        visible = _stream_extract_answer(stream_state, token)
-                        if visible:
-                            yield {"type": "token", "text": visible}
-                    answer_data = _extract_json(full_content)
-                except Exception as e:
-                    logger.error(f"process_stream LLM failed: {e!r}", exc_info=True)
-                    answer_data = self._stream_fallback(product, offers, price_analysis, eq_analysis)
-                    yield {"type": "token", "text": answer_data["answer"]}
+            # Use the non-streaming LLM path — more reliable than accumulating stream tokens
+            # and parsing JSON afterwards. Simulate streaming after receiving complete answer.
+            answer_data = await self._generate_answer(
+                product, offers, price_history, intent, eq_analysis, message,
+            )
+            yield {"type": "token", "text": answer_data["answer"]}
 
             missing = answer_data.get("missing_information", [])
             if not price_history and "price_history" not in missing:
@@ -584,10 +1063,36 @@ class ChatOrchestrator:
                     actions_triggered=actions + ["equivalent_analysis_triggered"],
                     missing_information=answer_data.get("missing_information", []),
                 )
-                for token in resp.answer.split():
-                    yield {"type": "token", "text": token + " "}
+                yield {"type": "token", "text": resp.answer}
 
         # ── persist and finish ──────────────────────────────────────────
+        # eq_analysis available in-scope for the product-found path
+        stream_eq = eq_analysis if product else getattr(self, "_last_eq_analysis", None)
+
+        if stream_eq and _analysis_needs_low_confidence(stream_eq):
+            resp.confidence = "low"
+        elif self._conversation_context.get("analysis_run") and _analysis_needs_low_confidence(
+            self._conversation_context["analysis_run"]
+        ):
+            resp.confidence = "low"
+
+        def _cap(lst: list, n: int = 30) -> list:
+            return lst[:n] if lst else []
+
+        analysis_run_to_save = None
+        if stream_eq:
+            analysis_run_to_save = {
+                "run_id": stream_eq.get("run_id"),
+                "candidate_count": stream_eq.get("candidate_count", 0),
+                "valid_match_count": stream_eq.get("valid_match_count", 0),
+                "cross_brand_equivalents": _cap(stream_eq.get("cross_brand_equivalents", [])),
+                "partial_spec_equivalents": _cap(stream_eq.get("partial_spec_equivalents", [])),
+                "weak_candidates": _cap(stream_eq.get("weak_candidates", [])),
+                "best_match_score": stream_eq.get("best_match_score"),
+                "price_confidence": stream_eq.get("price_confidence"),
+                "recommendation": stream_eq.get("recommendation"),
+            }
+
         assistant_metadata = {
             "product_id": str(product.id) if product else None,
             "product_name": product.name if product else None,
@@ -597,6 +1102,7 @@ class ChatOrchestrator:
             "price_analysis": resp.price_analysis.model_dump() if resp.price_analysis else None,
             "sources_used": resp.sources_used,
             "actions_triggered": actions,
+            "analysis_run": analysis_run_to_save,
         }
         assistant_msg = await save_message(
             self.db, conversation_id, "assistant", resp.answer, metadata=assistant_metadata
@@ -608,6 +1114,263 @@ class ChatOrchestrator:
         yield {"type": "done", "data": resp.model_dump()}
 
     # ── helpers shared by process() and process_stream() ────────────────
+
+    # ── fresh analysis helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _slim_compact_for_llm(compact: dict) -> dict:
+        """Return a minimal context safe to send to the LLM.
+
+        Groq enforces a per-request payload limit (~32KB). The full compact
+        with all candidate lists easily exceeds this. We keep only:
+        - Scalar metadata (counts, scores)
+        - inferred_product specs
+        - The 4 pre-computed picks from candidate_recommendations (objects only,
+          no embedded lists — those are redundant because the picks already
+          represent the best from each bucket)
+        - A very small raw sample (3 items) for deep-dive enumeration
+        """
+        recs_full = compact.get("candidate_recommendations") or {}
+        # Strip the full embedded lists from recommendations — keep only scalar
+        # counts and the 4 pick objects. This alone removes the bulk of the payload.
+        recs_slim = {
+            "cheapest_candidate": recs_full.get("cheapest_candidate"),
+            "best_score_candidate": recs_full.get("best_score_candidate"),
+            "best_technical_candidate": recs_full.get("best_technical_candidate"),
+            "best_market_analyst_choice": recs_full.get("best_market_analyst_choice"),
+            "confirmed_equivalents_count": recs_full.get("confirmed_equivalents_count"),
+            "has_confirmed_equivalents": recs_full.get("has_confirmed_equivalents"),
+            "result_label": recs_full.get("result_label"),
+            "no_match_warning": recs_full.get("no_match_warning"),
+            "missing_critical_specs": recs_full.get("missing_critical_specs"),
+            "confidence_level": recs_full.get("confidence_level"),
+        }
+        # Raw sample for enumeration requests — prefer cross_brand, fall back to partial
+        best_raw = (
+            (compact.get("cross_brand_equivalents") or [])[:10]
+            or (compact.get("partial_spec_equivalents") or [])[:10]
+        )
+        slim: dict = {
+            "product_name": compact.get("product_name"),
+            "inferred_product": compact.get("inferred_product"),
+            "candidate_count": compact.get("candidate_count"),
+            "valid_match_count": compact.get("valid_match_count"),
+            "cross_brand_count": compact.get("cross_brand_count"),
+            "partial_spec_count": compact.get("partial_spec_count"),
+            "weak_candidate_count": compact.get("weak_candidate_count"),
+            "best_match_score": compact.get("best_match_score"),
+            "best_match_price": compact.get("best_match_price"),
+            "price_confidence": compact.get("price_confidence"),
+            "recommendation": compact.get("recommendation"),
+            "candidate_recommendations": {k: v for k, v in recs_slim.items() if v is not None},
+            "top_candidates_sample": best_raw or None,
+        }
+        return {k: v for k, v in slim.items() if v is not None}
+
+    @staticmethod
+    def _cap_fresh_for_metadata(full_result: dict) -> dict:
+        """Return a metadata-safe copy of a full analysis result (20 candidates per bucket max)."""
+        return {
+            **{k: v for k, v in full_result.items() if k not in (
+                "cross_brand_equivalents", "same_brand_listings",
+                "partial_spec_equivalents", "weak_candidates",
+            )},
+            "cross_brand_equivalents": (full_result.get("cross_brand_equivalents") or [])[:20],
+            "same_brand_listings": (full_result.get("same_brand_listings") or [])[:20],
+            "partial_spec_equivalents": (full_result.get("partial_spec_equivalents") or [])[:20],
+            "weak_candidates": (full_result.get("weak_candidates") or [])[:20],
+        }
+
+    async def _answer_from_compact_context(
+        self,
+        user_message: str,
+        compact: dict,
+        intent: str,
+        is_followup: bool = False,
+    ) -> dict:
+        """Generate a grounded LLM answer from a compact analysis context.
+
+        The compact dict (built by compact_analysis_context()) is the only data
+        passed to the LLM — the full result never reaches it.
+        """
+        if self.is_mock:
+            return self._mock_fresh_analysis_answer(compact, intent, user_message)
+
+        followup_note = (
+            "\n[FOLLOW-UP: Answering a question about previously retrieved analysis — do not re-trigger a search.]"
+            if is_followup else ""
+        )
+        context_messages = build_chat_context(
+            SYSTEM_ANALYSIS_ANSWER_PROMPT,
+            getattr(self, "_conversation_summary", None),
+            getattr(self, "_recent_messages", []),
+            compact,
+            f"{user_message}{followup_note}\n\n[System: intent={intent}]",
+        )
+        try:
+            resp = await self.llm.chat_messages(context_messages)
+            return _extract_json(resp["content"])
+        except Exception as e:
+            logger.error(f"_answer_from_compact_context LLM failed [{type(e).__name__}]: {e!r}", exc_info=False)
+            return self._fresh_analysis_fallback(compact)
+
+    def _mock_fresh_analysis_answer(self, compact: dict, intent: str, user_message: str) -> dict:
+        n = compact.get("candidate_count", 0)
+        valid = compact.get("valid_match_count", 0)
+        best_score_val = compact.get("best_match_score")
+        best_price = compact.get("best_match_price")
+        recs = compact.get("candidate_recommendations", {})
+        cheapest = recs.get("cheapest_candidate")
+        best_score_c = recs.get("best_score_candidate")
+        best_technical = recs.get("best_technical_candidate")
+        best_choice = recs.get("best_market_analyst_choice")
+        no_match_warning = recs.get("no_match_warning")
+        missing_specs = recs.get("missing_critical_specs")
+
+        confidence_limited = best_score_val is not None and best_score_val < EXACT_MATCH_SCORE_THRESHOLD
+        confidence = "low" if (confidence_limited or valid == 0) else "medium"
+
+        if valid == 0 or no_match_warning:
+            answer = (
+                "Aucun équivalent confirmé n'a été trouvé. "
+                "Les résultats ci-dessous sont des candidats à vérifier.\n"
+                f"**{n}** candidats analysés, **{valid}** correspondances confirmées.\n"
+            )
+        else:
+            answer = (
+                f"Analyse d'équivalents : **{n}** candidats trouvés, "
+                f"**{valid}** correspondances validées.\n"
+            )
+
+        if best_score_val is not None:
+            answer += f"Meilleur score global : **{best_score_val:.2f}**"
+            if best_price is not None:
+                answer += f", meilleur prix : **€{best_price:.2f}**"
+            answer += ".\n"
+        if confidence_limited:
+            answer += "⚠️ Confiance limitée — score insuffisant pour une correspondance exacte.\n"
+        if missing_specs:
+            answer += f"Specs manquantes dans la requête : {', '.join(missing_specs)}.\n"
+
+        if cheapest:
+            title = (cheapest.get("title") or "N/A")[:60]
+            answer += f"\n**Moins cher** : {title} — €{cheapest.get('price', 0):.2f} (score: {cheapest.get('score', 0):.2f})"
+        if best_score_c:
+            title = (best_score_c.get("title") or "N/A")[:60]
+            answer += f"\n**Meilleur score** : {title} — score={best_score_c.get('score', 0):.2f}, €{best_score_c.get('price', 0):.2f}"
+        if best_technical:
+            title = (best_technical.get("title") or "N/A")[:60]
+            sq = best_technical.get("spec_quality", 0) or 0
+            answer += f"\n**Meilleur technique** : {title} — spec_quality={sq:.2f}, score={best_technical.get('score', 0):.2f}"
+        if best_choice:
+            title = (best_choice.get("title") or "N/A")[:60]
+            answer += f"\n**Meilleur compromis (analyst)** : {title} — score={best_choice.get('score', 0):.2f}, €{best_choice.get('price', 0):.2f}"
+
+        return {
+            "answer": answer.strip(),
+            "observed_facts": [f"{n} candidates found", f"{valid} valid matches"],
+            "hypotheses": ["Prices may vary by merchant"],
+            "risks": ["Verify spec compatibility before purchase"],
+            "recommendations": ["Compare specs carefully"],
+            "confidence": confidence,
+            "missing_information": list(missing_specs or []) + ([] if n >= 3 else ["more_candidates"]),
+            "sources_used": ["serpapi"],
+        }
+
+    @staticmethod
+    def _fresh_analysis_fallback(compact: dict) -> dict:
+        """Rich fallback used when LLM JSON parsing fails.
+
+        Uses candidate_recommendations picks so the user always sees useful data.
+        """
+        n = compact.get("candidate_count", 0)
+        valid = compact.get("valid_match_count", 0)
+        best_score_val = compact.get("best_match_score")
+        recs = compact.get("candidate_recommendations", {})
+        cheapest = recs.get("cheapest_candidate")
+        best_score_c = recs.get("best_score_candidate")
+        best_technical = recs.get("best_technical_candidate")
+        best_choice = recs.get("best_market_analyst_choice")
+        no_match_warning = recs.get("no_match_warning")
+        missing_specs = recs.get("missing_critical_specs")
+        confidence_level = recs.get("confidence_level", "low")
+
+        lines: list[str] = []
+        if no_match_warning or valid == 0:
+            lines.append(
+                f"Aucun équivalent confirmé. {n} candidats analysés, {valid} correspondances validées."
+            )
+            lines.append(
+                "Les résultats ci-dessous sont des candidats à vérifier — "
+                "vérifier la compatibilité avant achat."
+            )
+        else:
+            lines.append(f"Analyse : {n} candidats trouvés, {valid} correspondances validées.")
+
+        if best_score_val is not None:
+            lines.append(f"Meilleur score global : {best_score_val:.2f}.")
+        if valid == 0 and best_score_val is not None:
+            lines.append(
+                f"Raison : aucun candidat n'atteint le seuil de correspondance exacte "
+                f"(seuil requis ≥ 0.88, meilleur obtenu : {best_score_val:.2f})."
+            )
+        if missing_specs:
+            lines.append(
+                f"Specs manquantes dans la requête : {', '.join(missing_specs)} — "
+                "ajouter ces specs affinerait les résultats."
+            )
+
+        if cheapest:
+            title = (cheapest.get("title") or "N/A")[:60]
+            lines.append(
+                f"\n**Moins cher** : {title} — "
+                f"€{cheapest.get('price', 0):.2f} (score: {cheapest.get('score', 0):.2f})"
+            )
+        if best_score_c:
+            title = (best_score_c.get("title") or "N/A")[:60]
+            lines.append(
+                f"**Meilleur score** : {title} — "
+                f"score={best_score_c.get('score', 0):.2f}, €{best_score_c.get('price', 0):.2f}"
+            )
+        if best_technical:
+            title = (best_technical.get("title") or "N/A")[:60]
+            lines.append(
+                f"**Meilleur technique** : {title} — "
+                f"spec_quality={best_technical.get('spec_quality', 0):.2f}, "
+                f"score={best_technical.get('score', 0):.2f}"
+            )
+        if best_choice:
+            title = (best_choice.get("title") or "N/A")[:60]
+            lines.append(
+                f"**Meilleur compromis (analyst)** : {title} — "
+                f"score={best_choice.get('score', 0):.2f}, €{best_choice.get('price', 0):.2f}"
+            )
+
+        # Enumerate partial candidates when no confirmed match exists
+        partials = recs.get("partial_candidates") or compact.get("partial_spec_equivalents", [])
+        if partials and valid == 0:
+            lines.append(f"\nCandidats partiels ({len(partials)}) :")
+            for c in partials[:6]:
+                title = (c.get("title") or "")[:60]
+                price = c.get("price")
+                price_str = f"€{price:.2f}" if price is not None else "prix N/A"
+                lines.append(f"• {title} — {price_str} — score={c.get('score', 0):.2f}")
+
+        return {
+            "answer": "\n".join(lines),
+            "observed_facts": [f"{n} candidates found", f"{valid} valid matches"],
+            "hypotheses": ["Prices may vary by merchant"],
+            "risks": ["Verify spec compatibility before purchase"],
+            "recommendations": (
+                ["Compare specs carefully", f"Add missing specs ({', '.join(missing_specs)}) to refine search"]
+                if missing_specs else ["Compare specs carefully"]
+            ),
+            "confidence": confidence_level,
+            "missing_information": list(missing_specs or []) + ([] if n >= 3 else ["more_candidates"]),
+            "sources_used": ["serpapi"],
+        }
+
+    # ────────────────────────────────────────────────────────────────────
 
     def _build_product_context(
         self,
@@ -676,9 +1439,28 @@ class ChatOrchestrator:
         conv_ctx = getattr(self, "_conversation_context", {})
         if not offers and conv_ctx.get("offers"):
             ctx["previous_offers_from_conversation"] = conv_ctx["offers"]
-        if not (eq_analysis and eq_analysis.get("cross_brand_equivalents")) and conv_ctx.get("equivalents"):
+
+        # Inject grounded candidates from stored analysis_run on follow-ups
+        # This is the source-of-truth for anti-hallucination: LLM must only list these.
+        stored_analysis = conv_ctx.get("analysis_run")
+        if stored_analysis and not eq_analysis:
+            ranked = _rank_all_candidates(stored_analysis)
+            ctx["grounded_candidates"] = {
+                "source": "stored_analysis_from_conversation",
+                "run_id": stored_analysis.get("run_id"),
+                "total_available": len(ranked),
+                "best_match_score": stored_analysis.get("best_match_score"),
+                "valid_match_count": stored_analysis.get("valid_match_count", 0),
+                "confidence_note": (
+                    "low — no confirmed strong match (score < 0.70 or 0 valid matches)"
+                    if _analysis_needs_low_confidence(stored_analysis)
+                    else "medium"
+                ),
+                "candidates": ranked,
+            }
+        elif not (eq_analysis and eq_analysis.get("cross_brand_equivalents")) and conv_ctx.get("equivalents"):
             ctx["previous_equivalents_from_conversation"] = conv_ctx["equivalents"][:10]
-        if not (eq_analysis and eq_analysis.get("weak_candidates")) and conv_ctx.get("weak_candidates"):
+        if not (eq_analysis and eq_analysis.get("weak_candidates")) and conv_ctx.get("weak_candidates") and not stored_analysis:
             ctx["previous_weak_candidates_from_conversation"] = conv_ctx["weak_candidates"][:10]
         return ctx
 
@@ -1245,12 +2027,15 @@ class ChatOrchestrator:
                 else:
                     actions.append("live_search_also_failed")
 
+        # Expose eq_analysis so process() can persist it in message metadata
+        self._last_eq_analysis = eq_analysis
+
         answer_data = await self._generate_answer(product, offers, price_history, intent, eq_analysis, user_message=message)
         price_analysis = self._compute_price_analysis(product, price_history)
         missing = answer_data.get("missing_information", [])
         if not price_history and "price_history" not in missing:
             missing.append("price_history")
-        return ChatResponse(
+        resp = ChatResponse(
             answer=answer_data.get("answer", "Analysis completed."),
             intent=intent,
             offers=offers,
@@ -1268,6 +2053,10 @@ class ChatOrchestrator:
             actions_triggered=actions,
             missing_information=missing,
         )
+        # Enforce confidence floor: if analysis shows low quality, override LLM's claim
+        if eq_analysis and _analysis_needs_low_confidence(eq_analysis):
+            resp.confidence = "low"
+        return resp
 
     async def _handle_no_product(
         self, message: str, intent: str,
@@ -1290,6 +2079,10 @@ class ChatOrchestrator:
         except Exception:
             inferred = {}
         answer_data, scored_candidates = await self._trigger_equivalent_analysis(message, inferred)
+        # Convert scored candidates to eq_analysis format and expose for metadata saving
+        self._last_eq_analysis = _scored_to_analysis(
+            scored_candidates, raw_count=len(scored_candidates)
+        ) if scored_candidates else None
 
         products_found = [
             ProductBrief(
@@ -1299,6 +2092,10 @@ class ChatOrchestrator:
             for s in scored_candidates[:5]
             if s.get("title")
         ]
+
+        confidence = answer_data.get("confidence", "low")
+        if self._last_eq_analysis and _analysis_needs_low_confidence(self._last_eq_analysis):
+            confidence = "low"
 
         return ChatResponse(
             answer=answer_data.get("answer", "No equivalent products found."),
@@ -1310,7 +2107,7 @@ class ChatOrchestrator:
                 risks=answer_data.get("risks", []),
                 recommendations=answer_data.get("recommendations", []),
             ),
-            confidence=answer_data.get("confidence", "low"),
+            confidence=confidence,
             sources_used=list(set(sources + answer_data.get("sources_used", []))),
             actions_triggered=actions + ["equivalent_analysis_triggered"],
             missing_information=answer_data.get("missing_information", []),
@@ -1433,7 +2230,22 @@ class ChatOrchestrator:
             ] if top else [],
         }
         conv_ctx = getattr(self, "_conversation_context", {})
-        if not top and conv_ctx.get("equivalents"):
+        stored_analysis = conv_ctx.get("analysis_run")
+        if not top and stored_analysis:
+            ranked = _rank_all_candidates(stored_analysis)
+            product_context["grounded_candidates"] = {
+                "source": "stored_analysis_from_conversation",
+                "total_available": len(ranked),
+                "best_match_score": stored_analysis.get("best_match_score"),
+                "valid_match_count": stored_analysis.get("valid_match_count", 0),
+                "confidence_note": (
+                    "low — no confirmed strong match"
+                    if _analysis_needs_low_confidence(stored_analysis)
+                    else "medium"
+                ),
+                "candidates": ranked,
+            }
+        elif not top and conv_ctx.get("equivalents"):
             product_context["previous_equivalents_from_conversation"] = conv_ctx["equivalents"][:10]
         if not top and conv_ctx.get("offers"):
             product_context["previous_offers_from_conversation"] = conv_ctx["offers"]

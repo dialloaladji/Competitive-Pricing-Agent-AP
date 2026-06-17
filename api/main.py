@@ -299,15 +299,9 @@ async def get_analysis_run(run_id: str, db: AsyncSession = Depends(get_db)):
 
 @app.post("/api/v1/products/analyze-equivalents")
 async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depends(get_db)):
-    from worker.tasks import (
-        agent_serpapi_search, normalize_candidates, score_candidates, agent_summarizer,
-    )
     from api.llm_client import get_llm_client
-    from worker.scoring import (
-        _is_electrical, ELECTRICAL_BRANDS, _infer_product_attributes,
-        split_by_quality, diversify_by_brand,
-    )
-    from api.schemas import VALID_CLASSIFICATIONS
+    from api.analysis_service import run_equivalent_analysis_from_text
+    from worker.scoring import _is_electrical, ELECTRICAL_BRANDS
 
     product_text = f"{data.description} {data.brand or ''} {data.sku or ''}"
     if not _is_electrical(product_text):
@@ -321,166 +315,45 @@ async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depend
             ),
         )
 
-    start_total = time.time()
-    inferred = _infer_product_attributes(
-        description=data.description,
-        brand=_clean_str(data.brand),
-        category=_clean_str(data.category),
-        name=_clean_str(data.name),
-    )
-    name = _clean_str(data.name) or inferred["name"]
-    category = _clean_str(data.category) or inferred["category"]
-    brand = _clean_str(data.brand) or inferred["brand"] or None
-    sku = _clean_str(data.sku)
-    curve = _clean_str(data.curve) or inferred["specs"].get("curve")
-    inferred_specs = inferred["specs"]
-
-    product = Product(
-        name=name,
-        description=data.description,
-        category=category,
-        brand=brand,
-        sku=sku,
-        target_price=data.target_price,
-        currency=data.currency,
-        voltage_v=data.voltage_v or inferred_specs.get("voltage_v"),
-        current_a=data.current_a or inferred_specs.get("current_a"),
-        poles=data.poles or inferred_specs.get("poles"),
-        curve=curve,
-        breaking_capacity_ka=data.breaking_capacity_ka or inferred_specs.get("breaking_capacity_ka"),
-        mounting=inferred_specs.get("mounting"),
-    )
-    db.add(product)
-    await db.commit()
-    await db.refresh(product)
-
-    run = AnalysisRun(product_id=product.id, status=AnalysisStatus.running,
-                      started_at=datetime.utcnow(), run_metadata={"trigger": "api_sync"})
-    db.add(run)
-    await db.commit()
-    await db.refresh(run)
-
-    run_id = str(run.id)
-    product_id = str(product.id)
     llm = get_llm_client()
     logger.info(f"LLM client: {type(llm).__name__}, mock_mode={settings.mock_mode}")
-
     try:
-        queries = [data.description[:200]]
-        logger.info(f"Searching SerpApi with: {queries[0][:80]}...")
-
-        scored = []
-        raw_candidates = []
-        try:
-            serpapi_results = await agent_serpapi_search(queries, run_id, iteration=1)
-            raw_candidates = serpapi_results[:60]
-        except Exception as e:
-            logger.warning(f"SerpApi search failed: {e}")
-
-        if raw_candidates:
-            normalized = normalize_candidates(raw_candidates)
-            logger.info(f"{len(raw_candidates)} raw → {len(normalized)} normalized")
-            scored = score_candidates(product, normalized)
-            logger.info(f"{len(normalized)} normalized → {len(scored)} scored")
-        else:
-            scored = []
-
-        total_latency = (time.time() - start_total) * 1000
-        target_currency = product.currency or "EUR"
-        reliable_scored, partial_scored, weak_scored = split_by_quality(
-            scored, product, target_currency=target_currency,
+        result = await run_equivalent_analysis_from_text(
+            query=data.description,
+            db=db,
+            persist=True,
+            llm=llm,
+            name=_clean_str(data.name),
+            brand=_clean_str(data.brand),
+            category=_clean_str(data.category),
+            sku=_clean_str(data.sku),
+            voltage_v=data.voltage_v,
+            current_a=data.current_a,
+            poles=data.poles,
+            curve=_clean_str(data.curve),
+            breaking_capacity_ka=data.breaking_capacity_ka,
+            target_price=data.target_price,
+            currency=data.currency or "EUR",
         )
-        logger.info(f"Reliable: {len(reliable_scored)}, Partial: {len(partial_scored)}, Weak: {len(weak_scored)}")
-
-        analysis = {}
-        recommendation = None
-        if len(scored) >= 3:
-            llm = get_llm_client()
-            summary = await agent_summarizer(llm, product, scored, run_id)
-            analysis = summary.get("analysis", {})
-            recommendation = analysis.get("summary")
-        else:
-            analysis = {
-                "market_overview": f"Only {len(scored)} equivalent(s) found.",
-                "recommendation": "Insufficient data for pricing recommendation. Need at least 3 equivalents (spec_quality >= 0.5, non-vague, with valid price).",
-                "confidence": 0.2,
-                "below_threshold": True,
-            }
-            recommendation = analysis["recommendation"]
-
-        best_source = reliable_scored if reliable_scored else scored
-        reliable_cross_brand = [s for s in best_source if not s.get("is_same_brand", False)]
-        if reliable_cross_brand:
-            best = reliable_cross_brand[0]
-        else:
-            best = best_source[0] if best_source else None
-
-        run.status = AnalysisStatus.completed
-        run.completed_at = datetime.utcnow()
-        run.total_latency_ms = total_latency
-        run.candidate_count = len(raw_candidates)
-        run.valid_match_count = len(reliable_scored)
-        run.best_match_price = best["price"] if best else None
-        run.best_match_score = best["score"] if best else None
-        run.price_confidence = analysis.get("confidence")
-        run.final_decision = analysis
-        run.run_metadata = {"total_scored": len(scored), "weak": len(weak_scored)}
-        await db.commit()
-
-        for s in scored:
-            offer = Offer(
-                product_id=product.id,
-                source="analysis",
-                competitor_name=s.get("title", "")[:255],
-                title=s.get("title", ""),
-                price=s.get("price", 0),
-                currency=s.get("currency", "USD"),
-                url=s.get("url", ""),
-                merchant=s.get("merchant"),
-            )
-            db.add(offer)
-        if best:
-            snap = PriceSnapshot(
-                product_id=product.id,
-                price=best["price"],
-                currency=best.get("currency", "USD"),
-            )
-            db.add(snap)
-        await db.commit()
-
     except Exception as e:
-        run.status = AnalysisStatus.failed
-        run.error_message = str(e)
-        run.completed_at = datetime.utcnow()
-        await db.commit()
         import traceback
         logger.error(f"Analysis failed: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
     finally:
         await llm.close()
 
-    cross_brand_reliable = [s for s in reliable_scored if not s.get("is_same_brand", False)]
-    cross_brand_list, cross_brand_overflow, diversity_stats = diversify_by_brand(
-        cross_brand_reliable, max_per_brand=2, max_total=5, min_brand_count=3,
-    )
-    same_brand_list = [s for s in reliable_scored if s.get("is_same_brand", False)][:2]
-    weak_list = weak_scored[:10]
-    partial_list = partial_scored[:10]
-
-    brand_diversity_warning = None
-    if diversity_stats["needs_supplemental_search"]:
-        brand_diversity_warning = (
-            f"Only {diversity_stats['selected_brand_count']} distinct brand(s) found in cross-brand equivalents "
-            f"(target: >= {diversity_stats.get('min_brand_count', 3)}). Consider running a supplemental brand-targeted search."
-        )
-        logger.warning(brand_diversity_warning)
-
     def _to_out(s: dict) -> EquivalentOut:
         return EquivalentOut(
-            title=s["title"], price=s["price"], currency=s.get("currency", "EUR"),
-            merchant=s.get("merchant"), brand=s.get("brand"), url=s.get("url", ""),
-            score=s["score"], price_score=s["price_score"],
-            relevance_score=s["relevance_score"], trust_score=s["trust_score"],
+            title=s.get("title", ""),
+            price=s.get("price", 0),
+            currency=s.get("currency", "EUR"),
+            merchant=s.get("merchant"),
+            brand=s.get("brand"),
+            url=s.get("url", ""),
+            score=s.get("score", 0),
+            price_score=s.get("price_score", 0),
+            relevance_score=s.get("relevance_score", 0),
+            trust_score=s.get("trust_score", 0),
             spec_quality=s.get("spec_quality", 0.0),
             is_vague=s.get("is_vague", False),
             classification=s.get("classification", "unknown"),
@@ -488,43 +361,31 @@ async def analyze_equivalents(data: EquivalentRequest, db: AsyncSession = Depend
             specs=s.get("specs", {}),
         )
 
-    final_specs = {k: v for k, v in {
-        "voltage_v": product.voltage_v,
-        "current_a": product.current_a,
-        "poles": product.poles,
-        "curve": product.curve,
-        "breaking_capacity_ka": product.breaking_capacity_ka,
-        "mounting": product.mounting,
-    }.items() if v is not None}
-    inferred_product = {
-        "name": product.name,
-        "category": product.category,
-        "brand": product.brand,
-        "specs": final_specs,
-    }
+    partial_list = result.get("partial_spec_equivalents", [])[:10]
+    weak_list = result.get("weak_candidates", [])[:10]
 
     return AnalyzeEquivalentsResponse(
-        product_id=product_id,
-        product_name=product.name,
-        run_id=run_id,
-        total_latency_ms=total_latency,
-        candidate_count=run.candidate_count or 0,
-        valid_match_count=len(reliable_scored),
-        cross_brand_count=len(cross_brand_list),
-        same_brand_count=len(same_brand_list),
-        weak_candidate_count=len(weak_scored),
-        best_match_price=best["price"] if best else None,
-        best_match_score=best["score"] if best else None,
-        price_confidence=analysis.get("confidence"),
-        recommendation=recommendation,
-        cross_brand_equivalents=[_to_out(s) for s in cross_brand_list],
-        same_brand_listings=[_to_out(s) for s in same_brand_list],
+        product_id=result["product_id"],
+        product_name=result["product_name"],
+        run_id=result["run_id"],
+        total_latency_ms=result["total_latency_ms"],
+        candidate_count=result["candidate_count"],
+        valid_match_count=result["valid_match_count"],
+        cross_brand_count=result["cross_brand_count"],
+        same_brand_count=result["same_brand_count"],
+        weak_candidate_count=result["weak_candidate_count"],
+        best_match_price=result["best_match_price"],
+        best_match_score=result["best_match_score"],
+        price_confidence=result["price_confidence"],
+        recommendation=result["recommendation"],
+        cross_brand_equivalents=[_to_out(s) for s in result.get("cross_brand_equivalents", [])],
+        same_brand_listings=[_to_out(s) for s in result.get("same_brand_listings", [])],
         weak_candidates=[_to_out(s) for s in weak_list],
         partial_spec_equivalents=[_to_out(s) for s in partial_list],
-        partial_spec_count=len(partial_list),
-        brand_diversity_warning=brand_diversity_warning,
-        brand_diversity_stats=diversity_stats,
-        inferred_product=inferred_product,
+        partial_spec_count=result["partial_spec_count"],
+        brand_diversity_warning=result["brand_diversity_warning"],
+        brand_diversity_stats=result["brand_diversity_stats"],
+        inferred_product=result["inferred_product"],
     )
 @app.get("/api/v1/products/{product_id}/offers")
 async def get_offers(product_id: str, db: AsyncSession = Depends(get_db)):

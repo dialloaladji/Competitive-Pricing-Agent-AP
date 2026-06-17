@@ -89,6 +89,8 @@ async def get_conversation_context(
     equivalents: list = []
     weak_candidates: list = []
     price_analysis = None
+    analysis_run: dict | None = None
+    fresh_equivalent_analysis: dict | None = None
 
     for msg in assistant_msgs:
         meta = msg.msg_metadata or {}
@@ -103,7 +105,11 @@ async def get_conversation_context(
             weak_candidates = meta["weak_candidates"]
         if price_analysis is None and meta.get("price_analysis"):
             price_analysis = meta["price_analysis"]
-        if product_id and offers and equivalents:
+        if analysis_run is None and meta.get("analysis_run"):
+            analysis_run = meta["analysis_run"]
+        if fresh_equivalent_analysis is None and meta.get("fresh_equivalent_analysis"):
+            fresh_equivalent_analysis = meta["fresh_equivalent_analysis"]
+        if product_id and offers and equivalents and analysis_run and fresh_equivalent_analysis:
             break
 
     return {
@@ -115,6 +121,8 @@ async def get_conversation_context(
         "equivalents": equivalents,
         "weak_candidates": weak_candidates,
         "price_analysis": price_analysis,
+        "analysis_run": analysis_run,
+        "fresh_equivalent_analysis": fresh_equivalent_analysis,
     }
 
 

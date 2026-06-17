@@ -85,6 +85,11 @@ class GroqClient:
             "model": self.model,
         }
 
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=2, max=20),
+        retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException)),
+    )
     async def chat_messages(self, messages: list[dict], max_tokens: int | None = None) -> dict[str, Any]:
         start = time.time()
         response = await self.client.post(
@@ -101,6 +106,7 @@ class GroqClient:
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", 10))
             await asyncio.sleep(retry_after)
+            response.raise_for_status()  # raises → tenacity retries
         response.raise_for_status()
         data = response.json()
         latency = (time.time() - start) * 1000
